@@ -1,13 +1,12 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-Bot Zaffex - Réplica exacta de la estrategia original
+Bot Zaffex - Réplica exacta para CoinEx
+- Exchange: CoinEx
+- Pares: BTC/USDT, ETH/USDT
 - Timeframe: 1m
 - RSI(9) < 25 para entrada
 - TP: 1.0%, SL: 1.2%
-- 3 modos: agresivo (3 lotes), moderado (4 lotes), conservador (5 lotes)
-- Solo largo (LONG)
-- Operaciones pequeñas ($0.50-$15 por lote)
 """
 
 import os
@@ -35,12 +34,12 @@ def load_env():
     from dotenv import load_dotenv
     load_dotenv()
     return {
-        'EXCHANGE': os.getenv('EXCHANGE', 'lbank'),
+        'EXCHANGE': os.getenv('EXCHANGE', 'coinex'),
         'API_KEY': os.getenv('API_KEY', ''),
         'API_SECRET': os.getenv('API_SECRET', ''),
         'TELEGRAM_TOKEN': os.getenv('TELEGRAM_TOKEN', ''),
         'TELEGRAM_IDS': os.getenv('TELEGRAM_ALLOWED_IDS', ''),
-        'SYMBOLS': os.getenv('SYMBOLS', 'btc_usdt,eth_usdt').split(','),
+        'SYMBOLS': os.getenv('SYMBOLS', 'BTC/USDT,ETH/USDT').split(','),
         'TIMEFRAME': os.getenv('TIMEFRAME', '1m'),
         'RSI_PERIOD': int(os.getenv('RSI_PERIOD', '9')),
         'RSI_THRESHOLD': float(os.getenv('RSI_THRESHOLD', '25')),
@@ -100,20 +99,34 @@ def calculate_rsi(prices, period=9):
     return 100 - (100 / (1 + rs))
 
 def get_exchange(config):
-    """Inicializar exchange"""
-    exchange_class = getattr(ccxt, config['EXCHANGE'], None)
-    if not exchange_class:
-        exchange_class = ccxt.binance
-    
-    return exchange_class({
-        'apiKey': config['API_KEY'],
-        'secret': config['API_SECRET'],
-        'enableRateLimit': True,
-    })
+    """Inicializar exchange CoinEx"""
+    try:
+        exchange = ccxt.coinex({
+            'apiKey': config['API_KEY'],
+            'secret': config['API_SECRET'],
+            'enableRateLimit': True,
+            'options': {
+                'defaultType': 'spot',
+            }
+        })
+        exchange.load_markets()
+        return exchange
+    except Exception as e:
+        print(f"[ERROR] CoinEx init: {e}")
+        return ccxt.binance({'enableRateLimit': True})
 
 def fetch_ohlcv(exchange, symbol, timeframe, limit=50):
-    """Obtener datos OHLCV"""
-    return exchange.fetch_ohlcv(symbol, timeframe, limit=limit)
+    """Obtener datos OHLCV de CoinEx"""
+    try:
+        return exchange.fetch_ohlcv(symbol, timeframe, limit=limit)
+    except Exception as e:
+        print(f"[ERROR] Fetch {symbol}: {e}")
+        if symbol == 'BTC/USDT':
+            return exchange.fetch_ohlcv('BTC/USDT', timeframe, limit=limit)
+        elif symbol == 'ETH/USDT':
+            return exchange.fetch_ohlcv('ETH/USDT', timeframe, limit=limit)
+        else:
+            raise e
 
 def save_state(equity, positions):
     """Guardar estado"""
@@ -167,8 +180,8 @@ def main():
     equity, positions = load_state()
     
     # Notificación de inicio
-    send_telegram("🤖 Bot Zaffex iniciado\nSaldo: $235\nModos: 3\nTimeframe: 1m", config)
-    print("[INFO] Bot Zaffex iniciado - Saldo: $235")
+    send_telegram("🤖 Bot Zaffex - CoinEx\nSaldo: $235\nPares: BTC/USDT, ETH/USDT", config)
+    print("[INFO] Bot Zaffex iniciado - CoinEx - Saldo: $235")
     
     last_fetch = {}
     
@@ -211,7 +224,7 @@ def main():
                         
                         # Notificación
                         send_telegram(
-                            f"📈 OPEN {symbol.upper()}\nModo: {mode}\nLotes: {lotes}\nPrecio: {current_price:.2f}",
+                            f"📈 OPEN {symbol}\nModo: {mode}\nLotes: {lotes}\nPrecio: {current_price:.2f}",
                             config
                         )
                         print(f"[OPEN] {symbol} {mode} x{lotes} @ {current_price:.2f}")
