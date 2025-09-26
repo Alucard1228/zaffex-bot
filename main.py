@@ -6,6 +6,7 @@ Bot Zaffex - Réplica exacta para CoinEx
 - Timeframe: 1m
 - RSI(9) < 25 para entrada
 - Cooldown de 5 minutos entre señales
+- Estadísticas diarias para gráficos
 """
 
 import os
@@ -21,6 +22,17 @@ import ccxt
 RUNNING = True
 STATE_FILE = "paper_state.json"
 CSV_FILE = "operaciones.csv"
+
+# Variables globales para estadísticas diarias
+daily_stats = {
+    'trades': [],
+    'hourly_ops': {},
+    'pnl_history': [],
+    'mode_ops': {'agresivo': 0, 'moderado': 0, 'conservador': 0},
+    'best_trade': 0,
+    'worst_trade': 0,
+    'start_equity': 235.0
+}
 
 def signal_handler(signum, frame):
     """Manejo limpio de señales de Railway"""
@@ -170,6 +182,86 @@ def log_operation(operation_type, data):
             data.get('equity', '')
         ])
 
+def update_daily_stats(pnl: float, mode: str, symbol: str):
+    """Actualizar estadísticas diarias"""
+    from datetime import datetime
+    
+    # Registrar operación
+    daily_stats['trades'].append({
+        'timestamp': datetime.now(),
+        'pnl': pnl,
+        'mode': mode,
+        'symbol': symbol
+    })
+    
+    # Actualizar por hora
+    current_hour = datetime.now().hour
+    daily_stats['hourly_ops'][current_hour] = daily_stats['hourly_ops'].get(current_hour, 0) + 1
+    
+    # Actualizar por modo
+    if mode in daily_stats['mode_ops']:
+        daily_stats['mode_ops'][mode] += 1
+    
+    # Actualizar PnL history
+    current_pnl = sum(t['pnl'] for t in daily_stats['trades'])
+    daily_stats['pnl_history'].append(current_pnl)
+    
+    # Actualizar mejor/peor trade
+    if pnl > daily_stats['best_trade']:
+        daily_stats['best_trade'] = pnl
+    if pnl < daily_stats['worst_trade']:
+        daily_stats['worst_trade'] = pnl
+
+def send_daily_summary_if_needed(tg, equity: float):
+    """Enviar resumen diario al final del día"""
+    from datetime import datetime, timezone
+    
+    now = datetime.now(timezone.utc)
+    # Enviar resumen a las 23:59 UTC
+    if now.hour == 23 and now.minute == 59 and len(daily_stats['trades']) > 0:
+        trades = len(daily_stats['trades'])
+        wins = len([t for t in daily_stats['trades'] if t['pnl'] > 0])
+        losses = trades - wins
+        pnl_total = sum(t['pnl'] for t in daily_stats['trades'])
+        
+        # Calcular drawdown máximo
+        equity_values = [daily_stats['start_equity']]
+        running_equity = daily_stats['start_equity']
+        for trade in daily_stats['trades']:
+            running_equity += trade['pnl']
+            equity_values.append(running_equity)
+        
+        min_equity = min(equity_values)
+        max_dd = max(0, (daily_stats['start_equity'] - min_equity) / daily_stats['start_equity'] * 100
+        
+        if tg.enabled():
+            # Importar la clase actualizada de telegram_notifier
+            from telegram_notifier import TelegramNotifier
+            tg_notifier = TelegramNotifier(os.getenv('TELEGRAM_TOKEN'), os.getenv('TELEGRAM_ALLOWED_IDS'))
+            tg_notifier.send_daily_summary(
+                date=now.strftime('%Y-%m-%d'),
+                trades=trades,
+                wins=wins,
+                losses=losses,
+                pnl_total=pnl_total,
+                equity=equity,
+                max_drawdown=max_dd,
+                hourly_data=daily_stats['hourly_ops'],
+                pnl_trend=daily_stats['pnl_history'],
+                mode_data=daily_stats['mode_ops'],
+                best_trade=daily_stats['best_trade'],
+                worst_trade=daily_stats['worst_trade']
+            )
+        
+        # Resetear estadísticas para el nuevo día
+        daily_stats['trades'] = []
+        daily_stats['hourly_ops'] = {}
+        daily_stats['pnl_history'] = []
+        daily_stats['mode_ops'] = {'agresivo': 0, 'moderado': 0, 'conservador': 0}
+        daily_stats['best_trade'] = 0
+        daily_stats['worst_trade'] = 0
+        daily_stats['start_equity'] = equity
+
 def main():
     global RUNNING
     
@@ -183,6 +275,7 @@ def main():
     # Inicializar
     exchange = get_exchange(config)
     equity, positions = load_state()
+    daily_stats['start_equity'] = equity
     
     # Notificación de inicio
     send_telegram("🤖 Bot Zaffex - CoinEx\nSaldo: $235\nPares: BTC/USDT, ETH/USDT", config)
@@ -193,6 +286,9 @@ def main():
     
     while RUNNING:
         try:
+            # Verificar si es hora de enviar resumen diario
+            send_daily_summary_if_needed(None, equity)
+            
             for symbol in config['SYMBOLS']:
                 # Verificar que el símbolo esté disponible
                 if symbol not in exchange.markets:
@@ -232,6 +328,8 @@ def main():
                     for mode, lotes, capital in modes:
                         lot_size = capital / lotes
                         qty = lot_size / current_price
+                        sl_price = current_price * (1 - config['SL_PCT'] / 100)
+                        tp_price = current_price * (1 + config['TP_PCT'] / 100)
                         
                         # Registrar apertura
                         log_operation('OPEN', {
@@ -241,11 +339,28 @@ def main():
                             'equity': equity
                         })
                         
-                        # Notificación
-                        send_telegram(
-                            f"📈 OPEN {symbol}\nModo: {mode}\nLotes: {lotes}\nPrecio: {current_price:.2f}",
-                            config
-                        )
+                        # Notificación mejorada (requiere telegram_notifier actualizado)
+                        try:
+                            from telegram_notifier import TelegramNotifier
+                            tg_notifier = TelegramNotifier(config['TELEGRAM_TOKEN'], config['TELEGRAM_IDS'])
+                            tg_notifier.send_open(
+                                symbol=symbol,
+                                mode=mode,
+                                lotes=lotes,
+                                entry=current_price,
+                                sl=sl_price,
+                                tp=tp_price,
+                                equity=equity,
+                                rsi=rsi,
+                                qty_total=qty,
+                                usdt_total=lot_size
+                            )
+                        except:
+                            # Fallback a notificación simple
+                            send_telegram(
+                                f"📈 OPEN {symbol}\nModo: {mode}\nLotes: {lotes}\nPrecio: {current_price:.2f}",
+                                config
+                            )
                         print(f"[OPEN] {symbol} {mode} x{lotes} @ {current_price:.2f}")
                 
                 last_fetch[symbol] = now
