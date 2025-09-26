@@ -2,11 +2,10 @@
 # -*- coding: utf-8 -*-
 """
 Bot Zaffex - Réplica exacta para CoinEx
-- Exchange: CoinEx
-- Pares: BTC/USDT, ETH/USDT
+- Símbolos correctos: BTC/USDT, ETH/USDT
 - Timeframe: 1m
 - RSI(9) < 25 para entrada
-- TP: 1.0%, SL: 1.2%
+- Cooldown de 5 minutos entre señales
 """
 
 import os
@@ -51,6 +50,7 @@ def load_env():
         'CAP_AGRESIVO': float(os.getenv('CAPITAL_AGRESIVO', '47')),
         'CAP_MODERADO': float(os.getenv('CAPITAL_MODERADO', '35')),
         'CAP_CONSERVADOR': float(os.getenv('CAPITAL_CONSERVADOR', '23')),
+        'SIGNAL_COOLDOWN': int(os.getenv('SIGNAL_COOLDOWN', '300')),
     }
 
 def send_telegram(message, config):
@@ -110,6 +110,7 @@ def get_exchange(config):
             }
         })
         exchange.load_markets()
+        print(f"[COINEX] Mercados cargados: {len(exchange.markets)} pares")
         return exchange
     except Exception as e:
         print(f"[ERROR] CoinEx init: {e}")
@@ -118,15 +119,19 @@ def get_exchange(config):
 def fetch_ohlcv(exchange, symbol, timeframe, limit=50):
     """Obtener datos OHLCV de CoinEx"""
     try:
+        # Verificar que el símbolo exista
+        if symbol not in exchange.markets:
+            print(f"[WARN] Símbolo {symbol} no encontrado. Mercados disponibles: {list(exchange.markets.keys())[:10]}")
+            # Intentar encontrar variante
+            if 'BTC/USDT' in exchange.markets:
+                symbol = 'BTC/USDT'
+            elif 'ETH/USDT' in exchange.markets:
+                symbol = 'ETH/USDT'
+        
         return exchange.fetch_ohlcv(symbol, timeframe, limit=limit)
     except Exception as e:
         print(f"[ERROR] Fetch {symbol}: {e}")
-        if symbol == 'BTC/USDT':
-            return exchange.fetch_ohlcv('BTC/USDT', timeframe, limit=limit)
-        elif symbol == 'ETH/USDT':
-            return exchange.fetch_ohlcv('ETH/USDT', timeframe, limit=limit)
-        else:
-            raise e
+        raise e
 
 def save_state(equity, positions):
     """Guardar estado"""
@@ -184,10 +189,16 @@ def main():
     print("[INFO] Bot Zaffex iniciado - CoinEx - Saldo: $235")
     
     last_fetch = {}
+    last_signal_time = {}  # Control de cooldown por símbolo
     
     while RUNNING:
         try:
             for symbol in config['SYMBOLS']:
+                # Verificar que el símbolo esté disponible
+                if symbol not in exchange.markets:
+                    print(f"[SKIP] Símbolo no disponible: {symbol}")
+                    continue
+                
                 # Evitar fetch demasiado frecuente
                 now = time.time()
                 if symbol in last_fetch and (now - last_fetch[symbol]) < 2:
@@ -200,9 +211,17 @@ def main():
                 
                 # Calcular RSI
                 rsi = calculate_rsi(closes, config['RSI_PERIOD'])
+                print(f"[DEBUG] {symbol} → Precio: {current_price:.2f} | RSI: {rsi:.2f}")
                 
-                # Verificar señales de entrada
-                if rsi < config['RSI_THRESHOLD']:
+                # Verificar señales de entrada CON COOLDOWN
+                cooldown_key = f"{symbol}_last_signal"
+                last_signal = last_signal_time.get(cooldown_key, 0)
+                cooldown_period = config['SIGNAL_COOLDOWN']  # 300 segundos = 5 minutos
+                
+                if rsi < config['RSI_THRESHOLD'] and (now - last_signal) > cooldown_period:
+                    # Registrar el tiempo de la señal
+                    last_signal_time[cooldown_key] = now
+                    
                     # Abrir posiciones en los 3 modos
                     modes = [
                         ('agresivo', config['LOT_AGRESIVO'], config['CAP_AGRESIVO']),
