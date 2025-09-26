@@ -232,7 +232,8 @@ def send_daily_summary_if_needed(tg, equity: float):
             equity_values.append(running_equity)
         
         min_equity = min(equity_values)
-        max_dd = max(0, (daily_stats['start_equity'] - min_equity) / daily_stats['start_equity'] * 100
+        drawdown_pct = (daily_stats['start_equity'] - min_equity) / daily_stats['start_equity'] * 100
+        max_dd = max(0, drawdown_pct)
         
         if tg.enabled():
             # Importar la clase actualizada de telegram_notifier
