@@ -11,21 +11,25 @@ Zaffex bot — CoinEx spot (Railway-ready)
 - Singleton lock para evitar instancias duplicadas
 - Posiciones por clave (symbol, mode)  ✅
 - Persistencia ligera de posiciones y estado RSI en /tmp  ✅
-- Notificaciones “rich” por Telegram (apertura/cierre)  ✅
+- Notificaciones “rich” por Telegram (apertura/cierre/boot/totales)  ✅
+- Zona horaria configurable (TIMEZONE), por defecto America/New_York ✅
 """
 
 import os
 import time
 import signal
 import json
-from datetime import datetime, timezone
+from datetime import datetime
 from typing import Dict, List, Tuple, Optional
+from zoneinfo import ZoneInfo
 
 import ccxt
 
 # ---------------- Utilidades de tiempo / log ----------------
 def ts() -> str:
-    return datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S%z")
+    tz = ZoneInfo(CONFIG.get("TIMEZONE", "America/New_York"))
+    return datetime.now(tz).strftime("%Y-%m-%d %H:%M:%S%z")
+
 
 _last_debug: Dict[str, float] = {}
 def debug_throttled(tag: str, text: str, every_sec: float = 5.0):
@@ -114,7 +118,7 @@ CONFIG: Dict = {
     "TIMEFRAME": _get("TIMEFRAME","1m"),
     "RSI_PERIOD": _get_int("RSI_PERIOD","14"),
     "RSI_THRESHOLD": _get_int("RSI_THRESHOLD","30"),
-    "RSI_HYSTERESIS": _get_float("RSI_HYSTERESIS","2.0"),  # evita re-entradas pegadas
+    "RSI_HYSTERESIS": _get_float("RSI_HYSTERESIS","2.0"),
     "TP_PCT": _get_float("TAKE_PROFIT_PCT","1.0"),
     "SL_PCT": _get_float("STOP_LOSS_PCT","1.2"),
     "SIGNAL_COOLDOWN": _get_int("SIGNAL_COOLDOWN","300"),
@@ -132,11 +136,12 @@ CONFIG: Dict = {
     "SUMMARY_ENABLED": _get_bool("SUMMARY_ENABLED","1"),
     "SUMMARY_EVERY_MIN": _get_int("SUMMARY_EVERY_MIN","60"),
     "ACCOUNT_START": _get_float("ACCOUNT_START","0"),
+    "TIMEZONE": _get("TIMEZONE","America/New_York"),
 }
 
 def boot_summary() -> str:
     return (
-        f"[{ts()}] [BOOT] EXCHANGE={CONFIG['EXCHANGE']} LIVE={CONFIG['LIVE']} TZ=UTC\n"
+        f"[{ts()}] [BOOT] EXCHANGE={CONFIG['EXCHANGE']} LIVE={CONFIG['LIVE']} TZ={CONFIG['TIMEZONE']}\n"
         f"TF={CONFIG['TIMEFRAME']} Symbols={','.join(CONFIG['SYMBOLS'])}\n"
         f"RSI(p={CONFIG['RSI_PERIOD']},th={CONFIG['RSI_THRESHOLD']}) TP={CONFIG['TP_PCT']}% SL={CONFIG['SL_PCT']}% Cooldown={CONFIG['SIGNAL_COOLDOWN']}s\n"
         f"FeeRate={CONFIG['FEE_RATE']} Timeout={CONFIG['TIMEOUT_MIN']}m LossCooldown={CONFIG['LOSS_COOLDOWN_SEC']}s\n"
@@ -387,7 +392,6 @@ def open_position(ex, markets, symbol: str, mode: str, context: str = ""):
         "opened_at": now_ts(),
         "entry_fee": entry_fee,
     }
-    # persist
     try:
         data = {
             "positions": {f"{s}|{m}": v for (s, m), v in positions.items()},
@@ -397,7 +401,6 @@ def open_position(ex, markets, symbol: str, mode: str, context: str = ""):
     except Exception:
         pass
 
-    # Telegram rich
     try:
         if notifier and notifier.enabled():
             try:
@@ -453,7 +456,6 @@ def maybe_close_one(ex, key: Tuple[str, str]):
     except Exception:
         pass
 
-    # Telegram rich
     try:
         if notifier and notifier.enabled():
             try:
@@ -468,7 +470,7 @@ def maybe_close_one(ex, key: Tuple[str, str]):
                     entry=pos['entry'], qty=pos['qty'], hold_sec=now_ts()-pos.get('opened_at', now_ts())
                 )
         else:
-            tg(f"[{ts()}] [CLOSE] {symbol} {mode.UPPER()} reason={why} gross={gross_pnl:+.6f} fees={(entry_fee+exit_fee):.6f} pnl={pnl_net:+.6f}")
+            tg(f"[{ts()}] [CLOSE] {symbol} {mode.upper()} reason={why} gross={gross_pnl:+.6f} fees={(entry_fee+exit_fee):.6f} pnl={pnl_net:+.6f}")
     except Exception:
         pass
 
@@ -476,7 +478,6 @@ def maybe_close_one(ex, key: Tuple[str, str]):
         last_loss_time[key] = now_ts()
 
     positions.pop(key, None)
-    # persist
     try:
         data = {
             "positions": {f"{s}|{m}": v for (s, m), v in positions.items()},
@@ -499,7 +500,6 @@ def main():
 
         STATS = load_stats()
 
-        # restaurar posiciones + estado RSI si existiera
         try:
             persisted = load_json_file(POSITIONS_FILE, {})
             pos_loaded = persisted.get("positions", {})
@@ -514,29 +514,37 @@ def main():
         boot = boot_summary()
         print(boot)
         try:
-            totals_line = f"[{ts()}] [TOTALS] trades={STATS['trades']} wins={STATS['wins']} losses={STATS['losses']} pnl={STATS['pnl']:.2f} fees={STATS['fees']:.2f} volume={STATS['volume']:.2f} balance={STATS['balance']:.2f}"
-            print(totals_line)
             if notifier and notifier.enabled():
-                notifier.send(totals_line)
-        except Exception:
-            pass
-        try:
-            if notifier and notifier.enabled():
-                notifier.send(boot)
+                notifier.send_totals_rich(
+                    trades=STATS['trades'], wins=STATS['wins'], losses=STATS['losses'],
+                    pnl=STATS['pnl'], fees=STATS['fees'], volume=STATS['volume'], balance=STATS['balance']
+                )
+                notifier.send_boot_rich(
+                    live=CONFIG['LIVE'],
+                    exchange=CONFIG['EXCHANGE'],
+                    timeframe=CONFIG['TIMEFRAME'],
+                    symbols=",".join(CONFIG['SYMBOLS']),
+                    rsi_p=CONFIG['RSI_PERIOD'], rsi_th=CONFIG['RSI_THRESHOLD'],
+                    tp_pct=CONFIG['TP_PCT'], sl_pct=CONFIG['SL_PCT'],
+                    cooldown_s=CONFIG['SIGNAL_COOLDOWN'],
+                    timeout_m=CONFIG['TIMEOUT_MIN'],
+                    loss_cd_s=CONFIG['LOSS_COOLDOWN_SEC'],
+                    cap_a=CONFIG['CAPITAL_AGRESIVO'], lot_a=CONFIG['LOT_SIZE_AGRESIVO'],
+                    cap_m=CONFIG['CAPITAL_MODERADO'], lot_m=CONFIG['LOT_SIZE_MODERADO'],
+                    cap_c=CONFIG['CAPITAL_CONSERVADOR'], lot_c=CONFIG['LOT_SIZE_CONSERVADOR']
+                )
         except Exception as _e:
             print(f"[{ts()}] [WARN] Telegram boot send failed: {_e}]")
 
         while RUNNING:
             loop_start = now_ts()
 
-            # 1) Intentar CERRAR primero todas las posiciones abiertas
             for key in list(positions.keys()):
                 try:
                     maybe_close_one(ex, key)
                 except Exception as e:
                     print(f"[{ts()}] [CLOSE/WARN] {key} -> {e}")
 
-            # 2) Escaneo para NUEVAS señales con lógica de cruce RSI
             for symbol in CONFIG["SYMBOLS"]:
                 try:
                     last_sig = last_signal_time.get(symbol, 0.0)
@@ -560,7 +568,6 @@ def main():
                                 open_position(ex, markets, symbol, mode, context=entry_ctx)
                             last_signal_time[symbol] = now_ts()
 
-                    # persistir periódicamente el estado RSI + posiciones
                     try:
                         data = {
                             "positions": {f"{s}|{m}": v for (s, m), v in positions.items()},
