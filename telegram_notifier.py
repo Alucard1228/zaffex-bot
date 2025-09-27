@@ -41,7 +41,7 @@ def _extract_rsi_from_reason(reason: str) -> Optional[float]:
 
 class TelegramNotifier:
     """
-    Notificador 'rich' para aperturas y cierres con datos claros.
+    Notificador 'rich' para aperturas, cierres, boot y totales.
     """
     def __init__(self, bot_token: str, allowed_ids_csv: str):
         self.bot_token = (bot_token or "").strip()
@@ -61,7 +61,6 @@ class TelegramNotifier:
             r = requests.post(self.base_url, json=payload, timeout=10)
             r.raise_for_status()
         except Exception:
-            # fallback sin parse_mode
             if parse_mode:
                 try:
                     payload.pop("parse_mode", None)
@@ -73,7 +72,33 @@ class TelegramNotifier:
         for cid in self.allowed_ids:
             self._send_raw(cid, text, parse_mode=parse_mode)
 
-    # -------- mensajes “rich” --------
+    # -------- Boot / Totales bonitos --------
+    def send_boot_rich(self, *, live: bool, exchange: str, timeframe: str, symbols: str,
+                       rsi_p: int, rsi_th: int, tp_pct: float, sl_pct: float,
+                       cooldown_s: int, timeout_m: int, loss_cd_s: int,
+                       cap_a: float, lot_a: int, cap_m: float, lot_m: int, cap_c: float, lot_c: int):
+        live_tag = "LIVE ✅" if live else "PAPER 🧪"
+        lines = []
+        lines.append("🚀 INICIO DEL BOT\n")
+        lines.append(f"🧩 Exchange: {exchange} | Modo: {live_tag}")
+        lines.append(f"⏰ Timeframe: {timeframe}")
+        lines.append(f"🧪 Estrategia: RSI({rsi_p} < {rsi_th})")
+        lines.append(f"🎯 TP/SL: {_fmt_pct(tp_pct)} / {_fmt_pct(sl_pct)}")
+        lines.append(f"⛓️ Cooldown: {cooldown_s}s | ⏱️ Timeout: {timeout_m}m | 🧊 LossCD: {loss_cd_s}s")
+        lines.append(f"📦 Símbolos: {symbols}")
+        lines.append(f"💰 Caps: A {cap_a}/x{lot_a} · M {cap_m}/x{lot_m} · C {cap_c}/x{lot_c}")
+        self.send("\n".join(lines))
+
+    def send_totals_rich(self, *, trades: int, wins: int, losses: int,
+                         pnl: float, fees: float, volume: float, balance: float):
+        lines = []
+        lines.append("📊 ESTADO INICIAL\n")
+        lines.append(f"• Trades: {trades} (W:{wins} / L:{losses})")
+        lines.append(f"• PnL: {_fmt_money(pnl)} | Fees: {_fmt_money(fees)}")
+        lines.append(f"• Volumen: {_fmt_money(volume)} | Balance: {_fmt_money(balance)}")
+        self.send("\n".join(lines))
+
+    # -------- mensajes “rich” de trade --------
     def send_trade_open_rich(self, *, symbol: str, mode: str, lots: int, timeframe: str,
                              price: float, tp: float, sl: float, qty: float,
                              reason: str, tp_pct: float, sl_pct: float,
@@ -98,8 +123,7 @@ class TelegramNotifier:
         lines.append(f"💼 Tamaño: {_fmt_money(notional)} ({_fmt_qty(qty)} {symbol.split('/')[0]})")
         if account_balance is not None:
             lines.append(f"🏦 Equity: {_fmt_money(account_balance)}")
-        msg = "\n".join(lines)
-        self.send(msg)
+        self.send("\n".join(lines))
 
     def send_trade_close_rich(self, *, symbol: str, mode: str, reason: str,
                               gross: float, fees: float, pnl: float,
@@ -117,8 +141,7 @@ class TelegramNotifier:
         lines.append(f"📊 PnL: {_fmt_money(pnl)} ({_fmt_pct(roi)})")
         lines.append(f"⏱️ Duración: {_fmt_dur(hold_sec)}")
         lines.append(f"🧾 Motivo: {reason}")
-        msg = "\n".join(lines)
-        self.send(msg)
+        self.send("\n".join(lines))
 
     # -------- compat (resúmenes/legacy) --------
     def fmt_money(self, x: float) -> str:
@@ -148,7 +171,7 @@ class TelegramNotifier:
         roi_line = f" | ROI={roi:.2f}%" if roi is not None else ""
         msg = (
             f"{emoji} CLOSE ({reason})\n"
-            f"• {symbol} {mode.UPPER()}\n"
+            f"• {symbol} {mode.upper()}\n"
             f"• gross={self.fmt_money(gross)} | fees={self.fmt_money(fees)}\n"
             f"• PnL={self.fmt_money(pnl)}{roi_line} | dur={dur}"
         )
