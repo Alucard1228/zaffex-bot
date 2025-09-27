@@ -1,4 +1,4 @@
-# telegram_notifier.py (versión con gráficos ASCII avanzados)
+# telegram_notifier.py
 import requests
 import time
 from datetime import datetime
@@ -10,7 +10,7 @@ class TelegramNotifier:
         self.allowed_ids = [id_str.strip() for id_str in str(allowed_ids or "").split(",") if id_str.strip()]
         self._enabled = bool(self.bot_token and self.allowed_ids)
         self.last_message_time = 0
-        self.message_cooldown = 1
+        self.message_cooldown = 1  # 1 segundo entre mensajes
 
     def enabled(self) -> bool:
         return self._enabled
@@ -36,12 +36,14 @@ class TelegramNotifier:
                 response = requests.post(url, json=payload, timeout=10)
                 if response.status_code == 200:
                     self.last_message_time = time.time()
+                else:
+                    print(f"[TELEGRAM] Error {response.status_code}: {response.text}")
             except Exception as e:
                 print(f"[TELEGRAM] Excepción: {e}")
 
-    def _create_hourly_bars(self, hourly_data: Dict[int, int], max_ops: int = 10) -> str:
+    def _create_hourly_bars(self, hourly_ Dict[int, int], max_ops: int = 10) -> str:
         """Crear gráfico de barras por hora"""
-        if not hourly_data:
+        if not hourly_
             return "Sin datos de operaciones"
         
         # Normalizar los datos
@@ -60,7 +62,7 @@ class TelegramNotifier:
         
         return "\n".join(bars) if bars else "Sin actividad"
 
-    def _create_pnl_trend(self, pnl_data: List[float]) -> str:
+    def _create_pnl_trend(self, pnl_ List[float]) -> str:
         """Crear gráfico de tendencia de PnL"""
         if not pnl_data or len(pnl_data) < 2:
             return "Sin datos de PnL"
@@ -93,9 +95,9 @@ class TelegramNotifier:
         trend_str = "\n".join([f"{' ' * 6}{line}" for line in reversed(lines)])
         return f"PnL Trend:\n{trend_str}"
 
-    def _create_mode_distribution(self, mode_data: Dict[str, int]) -> str:
+    def _create_mode_distribution(self, mode_ Dict[str, int]) -> str:
         """Crear gráfico circular ASCII para distribución por modo"""
-        if not mode_data:
+        if not mode_
             return "Sin datos por modo"
         
         total = sum(mode_data.values())
@@ -136,9 +138,9 @@ class TelegramNotifier:
 
     def send_daily_summary(self, date: str, trades: int, wins: int, losses: int, 
                           pnl_total: float, equity: float, max_drawdown: float,
-                          hourly_data: Dict[int, int] = None,
+                          hourly_ Dict[int, int] = None,
                           pnl_trend: List[float] = None,
-                          mode_data: Dict[str, int] = None,
+                          mode_ Dict[str, int] = None,
                           best_trade: float = 0,
                           worst_trade: float = 0):
         """Resumen diario con gráficos ASCII avanzados"""
@@ -207,23 +209,6 @@ class TelegramNotifier:
         
         self._send_to_all(text)
 
-    def send_performance_alert(self, metric: str, current_value: float, 
-                              threshold: float, alert_type: str = "info"):
-        """Alertas de rendimiento"""
-        alert_emojis = {"info": "ℹ️", "warning": "⚠️", "success": "✅", "error": "❌"}
-        emoji = alert_emojis.get(alert_type, "🔔")
-        
-        text = (
-            f"{emoji} <b>ALERTA DE RENDIMIENTO</b>\n\n"
-            f"<b>📊 Métrica:</b> {metric}\n"
-            f"<b>📈 Valor Actual:</b> {current_value:.2f}\n"
-            f"<b>🎯 Umbral:</b> {threshold:.2f}\n"
-            f"<b>⏰ Fecha:</b> {datetime.now().strftime('%Y-%m-%d %H:%M')}"
-        )
-        self._send_to_all(text)
-
-    # ... (mantener los otros métodos existentes: send_open, send_close, etc.)
-    
     def send_open(self, symbol: str, mode: str, lotes: int, entry: float, sl: float, tp: float, 
                   equity: float, rsi: float, qty_total: float, usdt_total: float):
         """Notificación mejorada para apertura"""
@@ -282,11 +267,42 @@ class TelegramNotifier:
         )
         self._send_to_all(text)
 
+    def send_market_alert(self, symbol: str, alert_type: str, current_price: float, 
+                         rsi: float, volatility: float = 0):
+        """Alertas de mercado en tiempo real"""
+        alert_emojis = {
+            "OVERSOLD": "⚠️",
+            "OVERBOUGHT": "⚠️", 
+            "VOLATILITY": "⚡",
+            "SIGNAL": "🎯"
+        }
+        
+        alert_messages = {
+            "OVERSOLD": f"RSI(9) = {rsi:.1f} (Sobreventa Extrema)",
+            "OVERBOUGHT": f"RSI(9) = {rsi:.1f} (Sobrecompra Extrema)",
+            "VOLATILITY": f"Volatilidad Alta: {volatility:.2f}%",
+            "SIGNAL": f"Señal de Trading Detectada"
+        }
+        
+        emoji = alert_emojis.get(alert_type, "🔔")
+        message = alert_messages.get(alert_type, alert_type)
+        
+        text = (
+            f"{emoji} <b>ALERTA DE MERCADO</b>\n\n"
+            f"<b>🪙 Símbolo:</b> {symbol}\n"
+            f"<b>📍 Precio:</b> ${current_price:,.2f}\n"
+            f"<b>📢 Alerta:</b> {message}\n"
+            f"<b>⏰ Timeframe:</b> 1m"
+        )
+        self._send_to_all(text)
+
     def send_error(self, error_msg: str):
+        """Notificación de errores mejorada"""
         text = f"🚨 <b>ERROR CRÍTICO</b>\n<pre>{error_msg[:300]}</pre>"
         self._send_to_all(text, parse_mode="HTML")
 
     def send_pause(self, minutes: int, reason: str = "Pérdidas diarias"):
+        """Notificación de pausa mejorada"""
         text = (
             f"⏸️ <b>PAUSA TEMPORAL</b>\n\n"
             f"<b>⏰ Duración:</b> {minutes} minutos\n"
@@ -297,4 +313,5 @@ class TelegramNotifier:
         self._send_to_all(text)
 
     def send(self, message: str):
+        """Método genérico para retrocompatibilidad"""
         self._send_to_all(message)
