@@ -3,8 +3,9 @@
 """
 Bot Zaffex - Réplica exacta para CoinEx
 - Cierre automático por TP/SL
-- RSI corregido
-- 200 velas para precisión
+- RSI preciso con librería ta
+- 200 velas para cálculo estable
+- Estadísticas diarias completas
 """
 
 import os
@@ -15,7 +16,6 @@ import csv
 from datetime import datetime, timezone
 import requests
 import ccxt
-import ta
 
 RUNNING = True
 STATE_FILE = "paper_state.json"
@@ -47,8 +47,8 @@ def load_env():
         'TELEGRAM_IDS': os.getenv('TELEGRAM_ALLOWED_IDS', ''),
         'SYMBOLS': os.getenv('SYMBOLS', 'BTC/USDT,ETH/USDT').split(','),
         'TIMEFRAME': os.getenv('TIMEFRAME', '1m'),
-        'RSI_PERIOD': int(os.getenv('RSI_PERIOD', '9')),
-        'RSI_THRESHOLD': float(os.getenv('RSI_THRESHOLD', '25')),
+        'RSI_PERIOD': int(os.getenv('RSI_PERIOD', '14')),
+        'RSI_THRESHOLD': float(os.getenv('RSI_THRESHOLD', '30')),
         'TP_PCT': float(os.getenv('TAKE_PROFIT_PCT', '1.0')),
         'SL_PCT': float(os.getenv('STOP_LOSS_PCT', '1.2')),
         'LOT_AGRESIVO': int(os.getenv('LOT_SIZE_AGRESIVO', '3')),
@@ -71,70 +71,44 @@ def send_telegram(message, config):
         pass
 
 def calculate_rsi(prices, period=14):
-    """Calcular RSI usando librería ta - MÁS PRECISO"""
+    """Calcular RSI usando librería ta - PRECISO Y FIABLE"""
     try:
         import pandas as pd
         import ta
         if len(prices) < period + 1:
             return 50.0
         series = pd.Series(prices)
-        rsi_series = ta.momentum.RSIIndicator(close=series, window=period).rsi()
-        rsi_value = rsi_series.iloc[-1]
-        # Manejar NaN
-        if pd.isna(rsi_value):
+        rsi_indicator = ta.momentum.RSIIndicator(close=series, window=period)
+        rsi_values = rsi_indicator.rsi()
+        rsi_value = rsi_values.iloc[-1]
+        if pd.isna(rsi_value) or rsi_value is None:
             return 50.0
         return float(rsi_value)
-    except:
-        # Fallback a cálculo manual si falla
-        return calculate_rsi_manual(prices, period)
-
-def calculate_rsi_manual(prices, period=14):
-    """Cálculo manual de RSI - VERSIÓN CORREGIDA"""
-    if len(prices) < period + 1:
+    except Exception as e:
+        print(f"[RSI_ERROR] {str(e)[:100]} - Usando RSI=50")
         return 50.0
-    
-    gains = []
-    losses = []
-    
-    for i in range(1, len(prices)):
-        change = prices[i] - prices[i-1]
-        if change > 0:
-            gains.append(change)
-            losses.append(0)
-        else:
-            gains.append(0)
-            losses.append(abs(change))
-    
-    if len(gains) < period:
-        return 50.0
-    
-    # Usar Wilder's Smoothing (método original)
-    avg_gain = sum(gains[:period]) / period
-    avg_loss = sum(losses[:period]) / period
-    
-    for i in range(period, len(gains)):
-        avg_gain = (avg_gain * (period - 1) + gains[i]) / period
-        avg_loss = (avg_loss * (period - 1) + losses[i]) / period
-    
-    if avg_loss == 0:
-        return 100.0
-    if avg_gain == 0:
-        return 0.0
-    
-    rs = avg_gain / avg_loss
-    return 100 - (100 / (1 + rs))
 
 def get_exchange(config):
     try:
-        exchange = ccxt.coinex({'apiKey': config['API_KEY'], 'secret': config['API_SECRET'], 'enableRateLimit': True, 'options': {'defaultType': 'spot',}})
+        exchange = ccxt.coinex({
+            'apiKey': config['API_KEY'],
+            'secret': config['API_SECRET'],
+            'enableRateLimit': True,
+            'options': {
+                'defaultType': 'spot',
+            }
+        })
         exchange.load_markets()
+        print(f"[COINEX] Mercados cargados: {len(exchange.markets)} pares")
         return exchange
-    except:
+    except Exception as e:
+        print(f"[ERROR] CoinEx init: {e}")
         return ccxt.binance({'enableRateLimit': True})
 
 def fetch_ohlcv(exchange, symbol, timeframe, limit=200):
     try:
         if symbol not in exchange.markets:
+            print(f"[WARN] Símbolo {symbol} no encontrado")
             if 'BTC/USDT' in exchange.markets:
                 symbol = 'BTC/USDT'
             elif 'ETH/USDT' in exchange.markets:
@@ -175,6 +149,66 @@ def log_operation(operation_type, data):
             data.get('equity', '')
         ])
 
+def update_daily_stats(pnl: float, mode: str, symbol: str):
+    from datetime import datetime
+    daily_stats['trades'].append({
+        'timestamp': datetime.now(),
+        'pnl': pnl,
+        'mode': mode,
+        'symbol': symbol
+    })
+    current_hour = datetime.now().hour
+    daily_stats['hourly_ops'][current_hour] = daily_stats['hourly_ops'].get(current_hour, 0) + 1
+    if mode in daily_stats['mode_ops']:
+        daily_stats['mode_ops'][mode] += 1
+    current_pnl = sum(t['pnl'] for t in daily_stats['trades'])
+    daily_stats['pnl_history'].append(current_pnl)
+    if pnl > daily_stats['best_trade']:
+        daily_stats['best_trade'] = pnl
+    if pnl < daily_stats['worst_trade']:
+        daily_stats['worst_trade'] = pnl
+
+def send_daily_summary_if_needed(tg, equity: float):
+    from datetime import datetime, timezone
+    now = datetime.now(timezone.utc)
+    if now.hour == 23 and now.minute == 59 and len(daily_stats['trades']) > 0:
+        trades = len(daily_stats['trades'])
+        wins = len([t for t in daily_stats['trades'] if t['pnl'] > 0])
+        losses = trades - wins
+        pnl_total = sum(t['pnl'] for t in daily_stats['trades'])
+        equity_values = [daily_stats['start_equity']]
+        running_equity = daily_stats['start_equity']
+        for trade in daily_stats['trades']:
+            running_equity += trade['pnl']
+            equity_values.append(running_equity)
+        min_equity = min(equity_values)
+        drawdown_pct = (daily_stats['start_equity'] - min_equity) / daily_stats['start_equity'] * 100
+        max_dd = max(0, drawdown_pct)
+        if tg.enabled():
+            from telegram_notifier import TelegramNotifier
+            tg_notifier = TelegramNotifier(os.getenv('TELEGRAM_TOKEN'), os.getenv('TELEGRAM_ALLOWED_IDS'))
+            tg_notifier.send_daily_summary(
+                date=now.strftime('%Y-%m-%d'),
+                trades=trades,
+                wins=wins,
+                losses=losses,
+                pnl_total=pnl_total,
+                equity=equity,
+                max_drawdown=max_dd,
+                hourly_data=daily_stats['hourly_ops'],
+                pnl_trend=daily_stats['pnl_history'],
+                mode_data=daily_stats['mode_ops'],
+                best_trade=daily_stats['best_trade'],
+                worst_trade=daily_stats['worst_trade']
+            )
+        daily_stats['trades'] = []
+        daily_stats['hourly_ops'] = {}
+        daily_stats['pnl_history'] = []
+        daily_stats['mode_ops'] = {'agresivo': 0, 'moderado': 0, 'conservador': 0}
+        daily_stats['best_trade'] = 0
+        daily_stats['worst_trade'] = 0
+        daily_stats['start_equity'] = equity
+
 def main():
     global RUNNING
     signal.signal(signal.SIGTERM, signal_handler)
@@ -184,7 +218,6 @@ def main():
     equity, positions = load_state()
     daily_stats['start_equity'] = equity
     
-    # Convertir posiciones a formato correcto
     position_objects = []
     for pos in positions:
         if isinstance(pos, dict):
@@ -197,22 +230,26 @@ def main():
                 'tp': float(pos.get('tp', 0)),
                 'open_time': pos.get('open_time', time.time())
             })
+    
     positions = position_objects
     last_fetch = {}
     last_signal_time = {}
     
+    send_telegram("🤖 Bot Zaffex - CoinEx\nSaldo: $235\nPares: BTC/USDT, ETH/USDT", config)
     print("[INFO] Bot Zaffex iniciado - CoinEx - Saldo: $235")
     
     while RUNNING:
         try:
+            send_daily_summary_if_needed(None, equity)
+            
             for symbol in config['SYMBOLS']:
                 if symbol not in exchange.markets:
                     continue
+                
                 now = time.time()
                 if symbol in last_fetch and (now - last_fetch[symbol]) < 2:
                     continue
                 
-                # Obtener datos con 200 velas
                 ohlcv = fetch_ohlcv(exchange, symbol, config['TIMEFRAME'], limit=200)
                 closes = [candle[4] for candle in ohlcv]
                 current_price = closes[-1]
@@ -224,9 +261,11 @@ def main():
                 for i, pos in enumerate(positions):
                     if pos['symbol'] != symbol:
                         continue
+                    
                     pnl = 0
                     should_close = False
                     reason = ""
+                    
                     if current_price >= pos['tp']:
                         should_close = True
                         reason = "TP"
@@ -235,21 +274,48 @@ def main():
                         should_close = True
                         reason = "SL"
                         pnl = (current_price - pos['entry']) * pos['qty']
+                    
                     if should_close:
                         fee = abs(pnl) * 0.001
                         equity += pnl - fee
-                        log_operation('CLOSE', {'symbol': symbol, 'mode': pos['mode'], 'entry': pos['entry'], 'exit': current_price, 'pnl': pnl - fee, 'equity': equity})
-                        # Notificación
+                        log_operation('CLOSE', {
+                            'symbol': symbol,
+                            'mode': pos['mode'],
+                            'entry': pos['entry'],
+                            'exit': current_price,
+                            'pnl': pnl - fee,
+                            'equity': equity
+                        })
+                        update_daily_stats(pnl - fee, pos['mode'], symbol)
+                        
                         try:
                             from telegram_notifier import TelegramNotifier
                             tg_notifier = TelegramNotifier(config['TELEGRAM_TOKEN'], config['TELEGRAM_IDS'])
                             duration_minutes = (time.time() - pos['open_time']) / 60
                             pnl_pct = (pnl / (pos['entry'] * pos['qty'])) * 100 if (pos['entry'] * pos['qty']) > 0 else 0
-                            tg_notifier.send_close(symbol=symbol, mode=pos['mode'], exit_price=current_price, pnl=pnl - fee, pnl_pct=pnl_pct, reason=reason, duration_minutes=duration_minutes, win_rate=0, equity=equity, total_ops=1, entry_price=pos['entry'])
+                            wins = len([t for t in daily_stats['trades'] if t['pnl'] > 0])
+                            total_ops = len(daily_stats['trades'])
+                            win_rate = (wins / total_ops * 100) if total_ops > 0 else 0
+                            
+                            tg_notifier.send_close(
+                                symbol=symbol,
+                                mode=pos['mode'],
+                                exit_price=current_price,
+                                pnl=pnl - fee,
+                                pnl_pct=pnl_pct,
+                                reason=reason,
+                                duration_minutes=duration_minutes,
+                                win_rate=win_rate,
+                                equity=equity,
+                                total_ops=total_ops,
+                                entry_price=pos['entry']
+                            )
                         except:
                             send_telegram(f"✅ CLOSE {symbol} {reason} PnL: {pnl - fee:.6f}", config)
+                        
                         print(f"[CLOSE] {symbol} {reason} PnL: {pnl - fee:.6f}")
                         positions_to_remove.append(i)
+                
                 for i in sorted(positions_to_remove, reverse=True):
                     positions.pop(i)
                 
@@ -257,33 +323,70 @@ def main():
                 cooldown_key = f"{symbol}_last_signal"
                 last_signal = last_signal_time.get(cooldown_key, 0)
                 cooldown_period = config['SIGNAL_COOLDOWN']
+                
                 if rsi < config['RSI_THRESHOLD'] and (now - last_signal) > cooldown_period:
                     last_signal_time[cooldown_key] = now
-                    modes = [('agresivo', config['LOT_AGRESIVO'], config['CAP_AGRESIVO']), ('moderado', config['LOT_MODERADO'], config['CAP_MODERADO']), ('conservador', config['LOT_CONSERVADOR'], config['CAP_CONSERVADOR'])]
+                    
+                    modes = [
+                        ('agresivo', config['LOT_AGRESIVO'], config['CAP_AGRESIVO']),
+                        ('moderado', config['LOT_MODERADO'], config['CAP_MODERADO']),
+                        ('conservador', config['LOT_CONSERVADOR'], config['CAP_CONSERVADOR'])
+                    ]
+                    
                     for mode, lotes, capital in modes:
                         lot_size = capital / lotes
                         qty = lot_size / current_price
                         sl_price = current_price * (1 - config['SL_PCT'] / 100)
                         tp_price = current_price * (1 + config['TP_PCT'] / 100)
-                        new_position = {'mode': mode, 'symbol': symbol, 'entry': current_price, 'qty': qty, 'sl': sl_price, 'tp': tp_price, 'open_time': time.time()}
+                        
+                        new_position = {
+                            'mode': mode,
+                            'symbol': symbol,
+                            'entry': current_price,
+                            'qty': qty,
+                            'sl': sl_price,
+                            'tp': tp_price,
+                            'open_time': time.time()
+                        }
                         positions.append(new_position)
-                        log_operation('OPEN', {'symbol': symbol, 'mode': mode, 'entry': current_price, 'equity': equity})
-                        # Notificación
+                        
+                        log_operation('OPEN', {
+                            'symbol': symbol,
+                            'mode': mode,
+                            'entry': current_price,
+                            'equity': equity
+                        })
+                        
                         try:
                             from telegram_notifier import TelegramNotifier
                             tg_notifier = TelegramNotifier(config['TELEGRAM_TOKEN'], config['TELEGRAM_IDS'])
-                            tg_notifier.send_open(symbol=symbol, mode=mode, lotes=lotes, entry=current_price, sl=sl_price, tp=tp_price, equity=equity, rsi=rsi, qty_total=qty, usdt_total=lot_size)
+                            tg_notifier.send_open(
+                                symbol=symbol,
+                                mode=mode,
+                                lotes=lotes,
+                                entry=current_price,
+                                sl=sl_price,
+                                tp=tp_price,
+                                equity=equity,
+                                rsi=rsi,
+                                qty_total=qty,
+                                usdt_total=lot_size
+                            )
                         except:
                             send_telegram(f"📈 OPEN {symbol} {mode} x{lotes} @ {current_price:.2f}", config)
+                        
                         print(f"[OPEN] {symbol} {mode} x{lotes} @ {current_price:.2f}")
+                
                 last_fetch[symbol] = now
+            
             save_state(equity, positions)
             time.sleep(2)
+            
         except Exception as e:
             print(f"[ERROR] {str(e)[:100]}")
             time.sleep(5)
+    
     print("[SHUTDOWN] Bot detenido correctamente")
 
 if __name__ == "__main__":
     main()
-
