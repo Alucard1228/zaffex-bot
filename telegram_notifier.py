@@ -28,7 +28,6 @@ def _fmt_dur(secs: float) -> str:
     return f"{s}s"
 
 def _extract_rsi_from_reason(reason: str) -> Optional[float]:
-    # espera "(RSI=25.79 < th=30)" o similar
     if not reason:
         return None
     m = re.search(r"RSI\s*=\s*([0-9]+(?:\.[0-9]+)?)", reason, re.IGNORECASE)
@@ -40,9 +39,7 @@ def _extract_rsi_from_reason(reason: str) -> Optional[float]:
     return None
 
 class TelegramNotifier:
-    """
-    Notificador 'rich' para aperturas, cierres, boot y totales.
-    """
+    """ Notificador 'rich' para aperturas, cierres, boot y totales. """
     def __init__(self, bot_token: str, allowed_ids_csv: str):
         self.bot_token = (bot_token or "").strip()
         self.allowed_ids: List[str] = [s.strip() for s in (allowed_ids_csv or "").split(",") if s.strip()]
