@@ -218,6 +218,7 @@ def main():
     equity, positions = load_state()
     daily_stats['start_equity'] = equity
     
+    # Convertir posiciones guardadas a objetos con todos los datos
     position_objects = []
     for pos in positions:
         if isinstance(pos, dict):
@@ -250,6 +251,7 @@ def main():
                 if symbol in last_fetch and (now - last_fetch[symbol]) < 2:
                     continue
                 
+                # Obtener datos con 200 velas para RSI preciso
                 ohlcv = fetch_ohlcv(exchange, symbol, config['TIMEFRAME'], limit=200)
                 closes = [candle[4] for candle in ohlcv]
                 current_price = closes[-1]
@@ -262,6 +264,7 @@ def main():
                     if pos['symbol'] != symbol:
                         continue
                     
+                    # Verificar si la posición debe cerrarse
                     pnl = 0
                     should_close = False
                     reason = ""
@@ -276,8 +279,11 @@ def main():
                         pnl = (current_price - pos['entry']) * pos['qty']
                     
                     if should_close:
+                        # Calcular fee (0.1%)
                         fee = abs(pnl) * 0.001
                         equity += pnl - fee
+                        
+                        # Registrar cierre
                         log_operation('CLOSE', {
                             'symbol': symbol,
                             'mode': pos['mode'],
@@ -286,8 +292,11 @@ def main():
                             'pnl': pnl - fee,
                             'equity': equity
                         })
+                        
+                        # Actualizar estadísticas
                         update_daily_stats(pnl - fee, pos['mode'], symbol)
                         
+                        # Notificación
                         try:
                             from telegram_notifier import TelegramNotifier
                             tg_notifier = TelegramNotifier(config['TELEGRAM_TOKEN'], config['TELEGRAM_IDS'])
@@ -310,12 +319,14 @@ def main():
                                 total_ops=total_ops,
                                 entry_price=pos['entry']
                             )
-                        except:
+                        except Exception as e:
+                            print(f"[ERROR] Notificación de cierre: {str(e)[:100]}")
                             send_telegram(f"✅ CLOSE {symbol} {reason} PnL: {pnl - fee:.6f}", config)
                         
                         print(f"[CLOSE] {symbol} {reason} PnL: {pnl - fee:.6f}")
                         positions_to_remove.append(i)
                 
+                # Eliminar posiciones cerradas
                 for i in sorted(positions_to_remove, reverse=True):
                     positions.pop(i)
                 
@@ -339,6 +350,7 @@ def main():
                         sl_price = current_price * (1 - config['SL_PCT'] / 100)
                         tp_price = current_price * (1 + config['TP_PCT'] / 100)
                         
+                        # Crear objeto de posición
                         new_position = {
                             'mode': mode,
                             'symbol': symbol,
@@ -350,6 +362,7 @@ def main():
                         }
                         positions.append(new_position)
                         
+                        # Registrar apertura
                         log_operation('OPEN', {
                             'symbol': symbol,
                             'mode': mode,
@@ -357,6 +370,7 @@ def main():
                             'equity': equity
                         })
                         
+                        # Notificación
                         try:
                             from telegram_notifier import TelegramNotifier
                             tg_notifier = TelegramNotifier(config['TELEGRAM_TOKEN'], config['TELEGRAM_IDS'])
@@ -372,13 +386,15 @@ def main():
                                 qty_total=qty,
                                 usdt_total=lot_size
                             )
-                        except:
+                        except Exception as e:
+                            print(f"[ERROR] Notificación de apertura: {str(e)[:100]}")
                             send_telegram(f"📈 OPEN {symbol} {mode} x{lotes} @ {current_price:.2f}", config)
                         
                         print(f"[OPEN] {symbol} {mode} x{lotes} @ {current_price:.2f}")
                 
                 last_fetch[symbol] = now
             
+            # Guardar estado con posiciones actualizadas
             save_state(equity, positions)
             time.sleep(2)
             
