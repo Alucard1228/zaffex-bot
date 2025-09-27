@@ -40,6 +40,9 @@ def _extract_rsi_from_reason(reason: str) -> Optional[float]:
     return None
 
 class TelegramNotifier:
+    """
+    Notificador 'rich' para aperturas y cierres con datos claros.
+    """
     def __init__(self, bot_token: str, allowed_ids_csv: str):
         self.bot_token = (bot_token or "").strip()
         self.allowed_ids: List[str] = [s.strip() for s in (allowed_ids_csv or "").split(",") if s.strip()]
@@ -145,7 +148,7 @@ class TelegramNotifier:
         roi_line = f" | ROI={roi:.2f}%" if roi is not None else ""
         msg = (
             f"{emoji} CLOSE ({reason})\n"
-            f"• {symbol} {mode.upper()}\n"
+            f"• {symbol} {mode.UPPER()}\n"
             f"• gross={self.fmt_money(gross)} | fees={self.fmt_money(fees)}\n"
             f"• PnL={self.fmt_money(pnl)}{roi_line} | dur={dur}"
         )
