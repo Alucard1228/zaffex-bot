@@ -1,1 +1,1 @@
-worker: python -u main.py
+python main_swap.py
