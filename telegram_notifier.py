@@ -1,6 +1,5 @@
+# telegram_notifier.py
 # -*- coding: utf-8 -*-
-import os
-import time
 import requests
 import logging
 
@@ -13,23 +12,45 @@ def _fmt_money(x: float) -> str:
         return f"{sign}${v:,.2f}"
     return f"{sign}${v:.2f}"
 
-def _fmt_pct(x: float) -> str:
-    sign = "" if x >= 0 else "-"
-    v = abs(x)
-    return f"{sign}{v:.2f}%"
+def format_duration(seconds: int) -> str:
+    if seconds < 60:
+        return f"{seconds}s"
+    m, s = divmod(seconds, 60)
+    if m < 60:
+        return f"{m}m {s}s"
+    h, m = divmod(m, 60)
+    return f"{h}h {m}m {s}s"
+
+def TPtoSL(entry: float, tp: float, sl: float) -> float:
+    if entry <= 0:
+        return 0.0
+    up = abs(tp - entry)
+    dn = abs(entry - sl)
+    if dn == 0:
+        return 0.0
+    return round(up / dn, 1)
 
 class TelegramNotifier:
-    def __init__(self, token: str, allowed_chat_ids):
-        self.token = token
+    """
+    Clase compatible con:
+      TelegramNotifier(token=..., allowed_chat_ids=[...])
+    y también con llamada posicional:
+      TelegramNotifier("BOT_TOKEN", [12345])
+    """
+    def __init__(self, token: str = "", allowed_chat_ids=None, **kwargs):
+        # compat: permitir argumentos posicionales antiguos
+        if isinstance(token, (list, tuple)) and allowed_chat_ids is None:
+            # Caso viejo: TelegramNotifier([ids]) – no recomendado, pero evitamos crashear
+            allowed_chat_ids = token
+            token = ""
+        self.token = token or ""
         self.allowed = []
-        for cid in allowed_chat_ids:
-            cid = cid.strip()
-            if not cid:
-                continue
-            try:
-                self.allowed.append(int(cid))
-            except Exception:
-                pass
+        if allowed_chat_ids:
+            for cid in allowed_chat_ids:
+                try:
+                    self.allowed.append(int(str(cid).strip()))
+                except Exception:
+                    pass
         self.api = f"https://api.telegram.org/bot{self.token}" if self.token else ""
         self.session = requests.Session() if self.token else None
 
@@ -55,7 +76,6 @@ class TelegramNotifier:
         self._post(text)
 
     # ----- Mensajes de negocio -----
-
     def send_open(self, symbol, mode, side, lots, entry, sl, tp, rsi, timeframe, size_usd, qty):
         text = (
             f"🔥 <b>{'LONG' if side=='LONG' else 'SHORT'} ABIERTO</b>\n\n"
@@ -87,9 +107,9 @@ class TelegramNotifier:
             f"{emoji} <b>CIERRE {side} ({reason})</b>\n\n"
             f"🪙 <b>Símbolo:</b> {symbol}\n"
             f"🎯 <b>Modo:</b> {mode}\n\n"
-            f"💵 <b>Gross:</b> {_fmt_money(gross)}\n"
-            f"💸 <b>Fees:</b> {_fmt_money(fees)}\n"
-            f"📊 <b>PnL:</b> {_fmt_money(pnl)}\n"
+            f"💵 <b>Gross:</b> {self._fmt_money(gross)}\n"
+            f"💸 <b>Fees:</b> {self._fmt_money(fees)}\n"
+            f"📊 <b>PnL:</b> {self._fmt_money(pnl)}\n"
             f"⏱️ <b>Duración:</b> {dur}\n"
         )
         self._post(text)
@@ -98,28 +118,16 @@ class TelegramNotifier:
         text = (
             f"📊 <b>RESUMEN 1h</b>\n\n"
             f"🧾 <b>Operaciones:</b> {trades}  (✅ {wins} · ❌ {losses})\n"
-            f"💵 <b>Gross:</b> {_fmt_money(gross)}\n"
-            f"💸 <b>Fees:</b> {_fmt_money(fees)}\n"
-            f"📈 <b>PnL neto:</b> {_fmt_money(pnl)}\n"
+            f"💵 <b>Gross:</b> {self._fmt_money(gross)}\n"
+            f"💸 <b>Fees:</b> {self._fmt_money(fees)}\n"
+            f"📈 <b>PnL neto:</b> {self._fmt_money(pnl)}\n"
         )
         self._post(text)
 
-# --------- Helpers de formato ---------
-def format_duration(seconds: int) -> str:
-    if seconds < 60:
-        return f"{seconds}s"
-    m, s = divmod(seconds, 60)
-    if m < 60:
-        return f"{m}m {s}s"
-    h, m = divmod(m, 60)
-    return f"{h}h {m}m {s}s"
-
-def TPtoSL(entry: float, tp: float, sl: float) -> float:
-    # ratio aproximado: distancia a TP / distancia a SL
-    if entry <= 0:
-        return 0.0
-    up = abs(tp - entry)
-    dn = abs(entry - sl)
-    if dn == 0:
-        return 0.0
-    return round(up / dn, 1)
+    @staticmethod
+    def _fmt_money(x: float) -> str:
+        sign = "" if x >= 0 else "-"
+        v = abs(x)
+        if v >= 1000:
+            return f"{sign}${v:,.2f}"
+        return f"{sign}${v:.2f}"
