@@ -1,649 +1,663 @@
-#!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-Zaffex FUTURES (CoinEx swap) — RSI scalping 1m (long + short)
-Con TP/SL en exchange (intento) + OCO emulado, y watchdog local como respaldo.
-- Entradas RSI: long < buy_th, short > sell_th (con histéresis)
-- TP/SL por modo, timeout, cooldown tras pérdida
-- Opcional: breakeven y trailing (local)
-- Órdenes de salida:
-    * Intenta colocar SL (stop-market reduceOnly) y TP parcial (limit reduceOnly) en CoinEx.
-    * Si falla la colocación (parámetros no soportados / error red), cae a manejo local (watchdog).
-    * OCO emulado: si se ejecuta uno, cancela el otro.
+Bot scalper RSI 1m con 3 modos (Agresivo/Moderado/Conservador)
+- Replica estilo Saffex (caps por modo con topes y lotes)
+- Mejoras: TP parcial, Break-even, Trailing, Timeout, Cooldowns
+- CoinEx: evita setLeverage/margin en spot; solo en mercados swap
+- Demo (LIVE=0) con ejecución local; Live (LIVE=1) con ccxt
 """
 
-import os, time, json, signal, math
-from typing import Dict, List, Tuple, Optional
-from datetime import datetime
-from zoneinfo import ZoneInfo
+import os
+import time
+import math
+import json
+import signal
+import logging
+from datetime import datetime, timezone, timedelta
 
+import requests
 import ccxt
 
-# -------------------- helpers de entorno --------------------
-def _get(name: str, default: Optional[str] = None) -> Optional[str]:
-    v = os.getenv(name, default)
-    return v if (v is not None and v != "") else default
-
-def _get_bool(name: str, default: str = "0") -> bool:
-    return (_get(name, default) or "").strip().lower() in ("1","true","yes","y")
-
-def _get_list(name: str, default: str = "") -> List[str]:
-    raw = (_get(name, default) or "")
-    return [s.strip() for s in raw.split(",") if s.strip()]
-
-def _get_float(name: str, default: str) -> float:
-    try: return float(_get(name, default))
-    except Exception: return float(default)
-
-def _get_int(name: str, default: str) -> int:
-    try: return int(float(_get(name, default)))
-    except Exception: return int(default)
-
-def _redact(s: str) -> str:
-    if not s: return ""
-    return (s[:3]+"..."+s[-3:]) if len(s)>6 else "***"
-
-CONFIG: Dict = {
-    "EXCHANGE": _get("EXCHANGE","coinex"),
-    "MARKET_TYPE": _get("COINEX_MARKET_TYPE","swap"),
-    "MARGIN_MODE": _get("MARGIN_MODE","cross"),
-    "LEVERAGE": _get_int("LEVERAGE","3"),
-    "API_KEY": _get("API_KEY",""),
-    "API_SECRET": _get("API_SECRET",""),
-    "LIVE": _get_bool("LIVE","0"),
-    "TIMEZONE": _get("TIMEZONE","America/New_York"),
-    "SYMBOLS": _get_list("SYMBOLS","BTC/USDT,ETH/USDT"),
-    "TIMEFRAME": _get("TIMEFRAME","1m"),
-    "RSI_PERIOD": _get_int("RSI_PERIOD","14"),
-    "RSI_BUY_THRESHOLD": _get_int("RSI_BUY_THRESHOLD","30"),
-    "RSI_SELL_THRESHOLD": _get_int("RSI_SELL_THRESHOLD","70"),
-    "RSI_HYSTERESIS": _get_float("RSI_HYSTERESIS","3.0"),
-    "TP_PCT": _get_float("TAKE_PROFIT_PCT","0.40"),
-    "SL_PCT": _get_float("STOP_LOSS_PCT","0.50"),
-    "TP_PCT_A": _get_float("TP_PCT_A","0.35"),
-    "SL_PCT_A": _get_float("SL_PCT_A","0.45"),
-    "TP_PCT_M": _get_float("TP_PCT_M","0.50"),
-    "SL_PCT_M": _get_float("SL_PCT_M","0.70"),
-    "TP_PCT_C": _get_float("TP_PCT_C","0.80"),
-    "SL_PCT_C": _get_float("SL_PCT_C","1.00"),
-    "SIGNAL_COOLDOWN": _get_int("SIGNAL_COOLDOWN","300"),
-    "LOSS_COOLDOWN_SEC": _get_int("LOSS_COOLDOWN_SEC","900"),
-    "TIMEOUT_MIN": _get_int("TIMEOUT_MIN","15"),
-    "FEE_RATE": _get_float("FEE_RATE","0.0008"),
-    "LOT_SIZE_AGRESIVO": _get_int("LOT_SIZE_AGRESIVO","3"),
-    "LOT_SIZE_MODERADO": _get_int("LOT_SIZE_MODERADO","4"),
-    "LOT_SIZE_CONSERVADOR": _get_int("LOT_SIZE_CONSERVADOR","5"),
-    "CAPITAL_AGRESIVO": _get_float("CAPITAL_AGRESIVO","50"),
-    "CAPITAL_MODERADO": _get_float("CAPITAL_MODERADO","500"),
-    "CAPITAL_CONSERVADOR": _get_float("CAPITAL_CONSERVADOR","10000"),
-    "ENABLE_BREAKEVEN": _get_bool("ENABLE_BREAKEVEN","1"),
-    "BE_TRIGGER_PCT": _get_float("BE_TRIGGER_PCT","0.30"),
-    "BE_OFFSET_PCT": _get_float("BE_OFFSET_PCT","0.05"),
-    "ENABLE_TRAIL": _get_bool("ENABLE_TRAIL","1"),
-    "TRAIL_TRIGGER_PCT": _get_float("TRAIL_TRIGGER_PCT","0.40"),
-    "TRAIL_STEP_PCT": _get_float("TRAIL_STEP_PCT","0.20"),
-    "TELEGRAM_TOKEN": _get("TELEGRAM_TOKEN",""),
-    "TELEGRAM_ALLOWED_IDS": _get_list("TELEGRAM_ALLOWED_IDS",""),
-    "SUMMARY_ENABLED": _get_bool("SUMMARY_ENABLED","1"),
-    "SUMMARY_EVERY_MIN": _get_int("SUMMARY_EVERY_MIN","60"),
-    "ACCOUNT_START": _get_float("ACCOUNT_START","0"),
-    "TP_PARTIAL_PCT": _get_float("TP_PARTIAL_PCT","50"),  # % qty para TP en exchange
-}
-
-# -------------------- tiempo --------------------
-def now_tz() -> datetime:
-    return datetime.now(ZoneInfo(CONFIG["TIMEZONE"]))
-
-def ts() -> str:
-    return now_tz().strftime("%Y-%m-%d %H:%M:%S%z")
-
-def pct(x: float) -> float:
-    return x/100.0
-
-def compute_fee(notional: float) -> float:
-    return notional * CONFIG["FEE_RATE"]
-
-# -------------------- Telegram --------------------
-notifier = None
 try:
-    from telegram_notifier import TelegramNotifier
-    if CONFIG["TELEGRAM_TOKEN"] and CONFIG["TELEGRAM_ALLOWED_IDS"]:
-        notifier = TelegramNotifier(CONFIG["TELEGRAM_TOKEN"], ",".join(CONFIG["TELEGRAM_ALLOWED_IDS"]))
-except Exception as _e:
-    print(f"[{ts()}] [WARN] Telegram init: {_e}]")
+    # En algunos contenedores tzdata no está, por eso permitimos fallback UTC
+    import zoneinfo
+    _has_zoneinfo = True
+except Exception:
+    _has_zoneinfo = False
 
-def tg(msg: str):
-    print(msg)
+from telegram_notifier import TelegramNotifier
+
+# ---------------------------
+# Utilidades de entorno
+# ---------------------------
+def getenv_str(key: str, default: str) -> str:
+    v = os.getenv(key)
+    return v if v is not None and v != "" else default
+
+def getenv_float(key: str, default: float) -> float:
+    v = os.getenv(key)
     try:
-        if notifier and notifier.enabled():
-            notifier.send(msg)
-    except Exception as _e:
-        print(f"[{ts()}] [WARN] Telegram send failed: {_e}]")
-
-# -------------------- CCXT (CoinEx swap) --------------------
-def build_exchange():
-    if CONFIG["EXCHANGE"].lower() != "coinex":
-        raise RuntimeError("Este build es para CoinEx")
-    ex = ccxt.coinex({
-        "apiKey": CONFIG["API_KEY"],
-        "secret": CONFIG["API_SECRET"],
-        "enableRateLimit": True,
-        "options": {"defaultType": CONFIG["MARKET_TYPE"]},  # 'swap'
-    })
-    return ex
-
-def load_markets_retry(ex, retries: int = 5, delay: float = 2.0):
-    for i in range(1, retries+1):
-        try:
-            return ex.load_markets()
-        except Exception as e:
-            print(f"[{ts()}] [WARN] load_markets {i}/{retries} -> {e}")
-            time.sleep(delay*i)
-    raise RuntimeError("load_markets failed")
-
-def set_symbol_leverage_and_mode(ex, symbol: str):
-    lev = CONFIG["LEVERAGE"]
-    mmode = CONFIG["MARGIN_MODE"]
-    try:
-        if hasattr(ex, 'setLeverage'):
-            ex.setLeverage(lev, symbol, params={})
-    except Exception as e:
-        print(f"[{ts()}] [LEV/WARN] {symbol} -> {e}")
-    try:
-        if hasattr(ex, 'setMarginMode'):
-            ex.setMarginMode(mmode, symbol, params={})
-    except Exception as e:
-        print(f"[{ts()}] [MMODE/WARN] {symbol} -> {e}")
-
-# -------------------- Mercado helpers --------------------
-def fetch_price(ex, symbol: str) -> float:
-    return float(ex.fetch_ticker(symbol)["last"])
-
-def fetch_closes(ex, symbol: str, timeframe: str, limit: int = 200) -> List[float]:
-    return [float(c[4]) for c in ex.fetch_ohlcv(symbol, timeframe=timeframe, limit=limit)]
-
-def clamp_qty_price(ex, symbol: str, qty: float, price: float) -> Tuple[float, float]:
-    return float(ex.amount_to_precision(symbol, qty)), float(ex.price_to_precision(symbol, price))
-
-# -------------------- RSI Wilder --------------------
-def rsi_wilder(closes: List[float], period: int = 14) -> Optional[float]:
-    n = len(closes)
-    if n < period + 1:
-        return None
-    gains = losses = 0.0
-    for i in range(1, period + 1):
-        d = closes[i] - closes[i - 1]
-        if d >= 0: gains += d
-        else: losses += -d
-    avg_gain = gains / period
-    avg_loss = losses / period
-    for i in range(period + 1, n):
-        d = closes[i] - closes[i - 1]
-        g = max(d, 0.0); l = max(-d, 0.0)
-        avg_gain = (avg_gain * (period - 1) + g) / period
-        avg_loss = (avg_loss * (period - 1) + l) / period
-    if avg_loss == 0: return 100.0
-    rs = avg_gain / avg_loss
-    return 100.0 - (100.0 / (1.0 + rs))
-
-# -------------------- Caps / tamaños --------------------
-def lots_by_mode(mode: str) -> int:
-    return {"agresivo": CONFIG["LOT_SIZE_AGRESIVO"],
-            "moderado": CONFIG["LOT_SIZE_MODERADO"],
-            "conservador": CONFIG["LOT_SIZE_CONSERVADOR"]}.get(mode, 0)
-
-def cap_by_mode(mode: str) -> float:
-    return {"agresivo": CONFIG["CAPITAL_AGRESIVO"],
-            "moderado": CONFIG["CAPITAL_MODERADO"],
-            "conservador": CONFIG["CAPITAL_CONSERVADOR"]}.get(mode, 0.0)
-
-def tp_sl_by_mode(mode: str) -> Tuple[float,float]:
-    if mode == "agresivo": return CONFIG["TP_PCT_A"], CONFIG["SL_PCT_A"]
-    if mode == "moderado": return CONFIG["TP_PCT_M"], CONFIG["SL_PCT_M"]
-    if mode == "conservador": return CONFIG["TP_PCT_C"], CONFIG["SL_PCT_C"]
-    return CONFIG["TP_PCT"], CONFIG["SL_PCT"]
-
-def notional_per_lot(mode: str) -> float:
-    lots = max(lots_by_mode(mode), 1)
-    return cap_by_mode(mode) / lots
-
-def size_from_notional(ex, symbol: str, notional: float, price: float) -> float:
-    qty = notional / price
-    qty, _ = clamp_qty_price(ex, symbol, qty, price)
-    return qty
-
-# -------------------- Persistencia --------------------
-POSITIONS_FILE = "/tmp/zaffex_swap_positions.json"
-STATS_FILE = "/tmp/zaffex_swap_stats.json"
-
-def load_json(path, default):
-    try:
-        if os.path.exists(path):
-            with open(path, "r", encoding="utf-8") as f: return json.load(f)
-    except Exception: pass
-    return default
-
-def save_json(path, data):
-    try:
-        with open(path, "w", encoding="utf-8") as f: json.dump(data, f)
-    except Exception: pass
-
-# -------------------- Estado --------------------
-RUNNING = True
-positions: Dict[Tuple[str, str, str], Dict] = {}  # (symbol, mode, side) -> pos
-last_signal_time: Dict[str, float] = {}
-last_loss_time: Dict[Tuple[str,str,str], float] = {}
-rsi_state: Dict[str, str] = {}  # 'below' | 'above' | 'mid'
-STATS = None
-
-def signal_handler(sig, frame):
-    global RUNNING
-    RUNNING = False
-    print(f"[{ts()}] [STOP] shutdown signal]")
-
-def stats_default():
-    return {"trades":0,"wins":0,"losses":0,"pnl":0.0,"fees":0.0,"volume":0.0,
-            "balance": float(CONFIG.get("ACCOUNT_START",0.0)),
-            "h_trades":0,"h_wins":0,"h_losses":0,"h_pnl":0.0,"h_fees":0.0,"h_volume":0.0,
-            "h_started": time.time(), "last_summary": time.time()}
-
-def load_stats():
-    s = load_json(STATS_FILE, None)
-    if not s: s = stats_default()
-    return s
-
-def save_stats(s):
-    save_json(STATS_FILE, s)
-
-def stats_on_close(s, pnl_net: float, fees: float, notional_exit: float):
-    s["trades"] += 1
-    if pnl_net >= 0: s["wins"] += 1
-    else: s["losses"] += 1
-    s["pnl"] += pnl_net
-    s["fees"] += fees
-    s["volume"] += abs(notional_exit)
-    s["balance"] = float(CONFIG.get("ACCOUNT_START",0.0)) + s["pnl"]
-    s["h_trades"] += 1
-    if pnl_net >= 0: s["h_wins"] += 1
-    else: s["h_losses"] += 1
-    s["h_pnl"] += pnl_net
-    s["h_fees"] += fees
-    s["h_volume"] += abs(notional_exit)
-
-# -------------------- Telegram resumen --------------------
-def maybe_send_summary():
-    if not CONFIG.get("SUMMARY_ENABLED", True):
-        return
-    s = STATS
-    now = time.time()
-    every = int(CONFIG.get("SUMMARY_EVERY_MIN",60))*60
-    if now - s.get("last_summary",0.0) >= every:
-        window = {"trades": s["h_trades"], "wins": s["h_wins"], "losses": s["h_losses"],
-                  "pnl": s["h_pnl"], "fees": s["h_fees"], "volume": s["h_volume"]}
-        totals = {"trades": s["trades"], "wins": s["wins"], "losses": s["losses"],
-                  "pnl": s["pnl"], "fees": s["fees"], "volume": s["volume"], "balance": s["balance"]}
-        try:
-            if notifier and notifier.enabled():
-                notifier.send_summary("last hour", window, totals)
-        except Exception: pass
-        s["h_trades"]=s["h_wins"]=s["h_losses"]=0
-        s["h_pnl"]=s["h_fees"]=s["h_volume"]=0.0
-        s["h_started"]=now; s["last_summary"]=now
-        save_stats(s)
-
-# -------------------- Gestión dinámica local --------------------
-def _apply_breakeven_and_trailing(pos: Dict, price: float):
-    # Breakeven
-    if CONFIG["ENABLE_BREAKEVEN"] and not pos.get("be_done", False):
-        be_trig = pct(CONFIG["BE_TRIGGER_PCT"])
-        be_off = pct(CONFIG["BE_OFFSET_PCT"])
-        if pos["side"]=="long":
-            if price >= pos["entry"] * (1 + be_trig):
-                new_sl = pos["entry"] * (1 + be_off)
-                pos["local_sl"] = max(pos.get("local_sl", pos["sl"]), new_sl)
-                pos["be_done"] = True
-        else:
-            if price <= pos["entry"] * (1 - be_trig):
-                new_sl = pos["entry"] * (1 - be_off)
-                pos["local_sl"] = min(pos.get("local_sl", pos["sl"]), new_sl)
-                pos["be_done"] = True
-
-    # Trailing
-    if CONFIG["ENABLE_TRAIL"]:
-        trig = pct(CONFIG["TRAIL_TRIGGER_PCT"])
-        step = pct(CONFIG["TRAIL_STEP_PCT"])
-        if pos["side"]=="long":
-            if price >= pos["entry"] * (1 + trig):
-                pos["trail_active"] = True
-                pos["trail_anchor"] = max(pos.get("trail_anchor", pos["entry"]), price)
-                trail_sl = pos["trail_anchor"] * (1 - step)
-                pos["local_sl"] = max(pos.get("local_sl", pos["sl"]), trail_sl)
-        else:
-            if price <= pos["entry"] * (1 - trig):
-                pos["trail_active"] = True
-                pos["trail_anchor"] = min(pos.get("trail_anchor", pos["entry"]), price)
-                trail_sl = pos["trail_anchor"] * (1 + step)
-                pos["local_sl"] = min(pos.get("local_sl", pos["sl"]), trail_sl)
-
-# -------------------- Exchange TP/SL helpers --------------------
-def place_exchange_exits(ex, symbol: str, pos: Dict):
-    """
-    Intenta colocar SL (stop-market reduceOnly) y TP parcial (limit reduceOnly).
-    Guarda ids en pos["sl_id"], pos["tp_id"]. Si algo falla, deja watchdog local.
-    """
-    qty = pos["qty"]
-    side = pos["side"]
-    entry = pos["entry"]
-    tp = pos["tp"]
-    sl = pos["sl"]
-
-    tp_qty = qty * max(0.0, min(1.0, CONFIG["TP_PARTIAL_PCT"]/100.0))
-    tp_qty = float(ex.amount_to_precision(symbol, tp_qty))
-    sl_qty = qty  # SL debe cubrir todo
-
-    # params genéricos ccxt; CoinEx suele aceptar reduceOnly, timeInForce
-    base_params = {"reduceOnly": True, "timeInForce": "GTC"}
-
-    # SL como stop-market reduceOnly
-    try:
-        if side == "long":
-            # cerrar con sell si se activa SL
-            sl_params = dict(base_params)
-            sl_params.update({"stopPrice": float(sl)})
-            try:
-                order = ex.create_order(symbol, "stop", "sell", sl_qty, None, sl_params)
-            except Exception:
-                sl_params2 = dict(base_params); sl_params2.update({"triggerPrice": float(sl)})
-                order = ex.create_order(symbol, "market", "sell", sl_qty, None, sl_params2)
-        else:
-            sl_params = dict(base_params)
-            sl_params.update({"stopPrice": float(sl)})
-            try:
-                order = ex.create_order(symbol, "stop", "buy", sl_qty, None, sl_params)
-            except Exception:
-                sl_params2 = dict(base_params); sl_params2.update({"triggerPrice": float(sl)})
-                order = ex.create_order(symbol, "market", "buy", sl_qty, None, sl_params2)
-        pos["sl_id"] = order.get("id")
-    except Exception as e:
-        print(f"[{ts()}] [SL/EXC/WARN] {symbol} -> {e}")
-
-    # TP parcial como limit reduceOnly
-    try:
-        if tp_qty > 0:
-            if side == "long":
-                order = ex.create_order(symbol, "limit", "sell", tp_qty, float(tp), dict(base_params))
-            else:
-                order = ex.create_order(symbol, "limit", "buy", tp_qty, float(tp), dict(base_params))
-            pos["tp_id"] = order.get("id")
-    except Exception as e:
-        print(f"[{ts()}] [TP/EXC/WARN] {symbol} -> {e}")
-
-def cancel_if_exists(ex, order_id: Optional[str], symbol: str):
-    if not order_id: return
-    try:
-        ex.cancel_order(order_id, symbol)
+        return float(v)
     except Exception:
-        pass
+        return float(default)
 
-# -------------------- Apertura / Cierre --------------------
-def open_position(ex, symbol: str, mode: str, side: str, reason: str):
-    key = (symbol, mode, side)
-    if key in positions:
-        return
-    if time.time() - last_loss_time.get(key, 0.0) < CONFIG["LOSS_COOLDOWN_SEC"]:
-        return
-
-    price = fetch_price(ex, symbol)
-    notional = notional_per_lot(mode)
-    if notional <= 0 or price <= 0:
-        return
-    qty = size_from_notional(ex, symbol, notional, price)
-    if qty <= 0: return
-
-    tp_pct, sl_pct = tp_sl_by_mode(mode)
-    entry = price
-    if side == "long":
-        tp = ex.price_to_precision(symbol, entry * (1 + pct(tp_pct)))
-        sl = ex.price_to_precision(symbol, entry * (1 - pct(sl_pct)))
-    else:
-        tp = ex.price_to_precision(symbol, entry * (1 - pct(tp_pct)))
-        sl = ex.price_to_precision(symbol, entry * (1 + pct(sl_pct)))
-    tp = float(tp); sl = float(sl)
-    qty, entry = clamp_qty_price(ex, symbol, qty, entry)
-
-    entry_fee = compute_fee(entry * qty)
-
-    if CONFIG["LIVE"]:
-        try:
-            side_ccxt = "buy" if side=="long" else "sell"
-            ex.create_order(symbol, "market", side_ccxt, qty)
-        except Exception as e:
-            print(f"[{ts()}] [OPEN/ERR] {symbol} {mode} {side} -> {e}")
-            return
-
-    positions[key] = {
-        "entry": entry, "qty": qty, "tp": tp, "sl": sl, "side": side,
-        "opened_at": time.time(), "entry_fee": entry_fee,
-        "trail_active": False, "trail_anchor": entry, "be_done": False,
-        # exchange exits
-        "sl_id": None, "tp_id": None,
-        # local fallback
-        "local_sl": sl,
-    }
-
-    # intentar colocar SL/TP en exchange
+def getenv_int(key: str, default: int) -> int:
+    v = os.getenv(key)
     try:
-        if CONFIG["LIVE"]:
-            place_exchange_exits(ex, symbol, positions[key])
-    except Exception as e:
-        print(f"[{ts()}] [EXITS/WARN] {symbol} -> {e}")
+        return int(v)
+    except Exception:
+        return int(default)
 
-    # Telegram
-    try:
-        if notifier and notifier.enabled():
-            notifier.send_trade_open_rich_futures(
-                symbol=symbol, mode=mode, side=side, lots=lots_by_mode(mode),
-                timeframe=CONFIG["TIMEFRAME"], price=entry, tp=tp, sl=sl, qty=qty,
-                reason=reason, tp_pct=tp_pct, sl_pct=sl_pct
-            )
-        else:
-            tg(f"[OPEN] {symbol} {mode} {side} qty={qty} @ {entry} tp={tp} sl={sl} {reason}")
-    except Exception: pass
-
-def maybe_close_one(ex, key: Tuple[str,str,str]):
-    pos = positions.get(key)
-    if not pos: return
-    symbol, mode, side = key
-    price = fetch_price(ex, symbol)
-
-    # dinámica local
-    _apply_breakeven_and_trailing(pos, price)
-
-    # watchdog local (si por lo que sea los exits del exchange no existen)
-    sl_watch = pos.get("local_sl", pos["sl"])
-    why = None
-    if side=="long":
-        if price >= pos["tp"]: why="TP(Local)"
-        elif price <= sl_watch: why="SL(Local)"
-    else:
-        if price <= pos["tp"]: why="TP(Local)"
-        elif price >= sl_watch: why="SL(Local)"
-
-    if not why and (time.time() - pos["opened_at"] >= CONFIG["TIMEOUT_MIN"]*60):
-        why = "TIMEOUT(Local)"
-
-    # Si no hay motivo local, igualmente comprobar si TP/SL en exchange ya se ejecutaron
-    if not why and CONFIG["LIVE"] and (pos.get("tp_id") or pos.get("sl_id")):
+def now_tz():
+    tzname = getenv_str("TIMEZONE", "UTC")
+    if _has_zoneinfo:
         try:
-            if pos.get("tp_id"):
-                info = ex.fetch_order(pos["tp_id"], symbol)
-                if info and info.get("status") in ("closed","canceled"):
-                    why = "TP(Exch)" if info.get("filled",0)>0 else None
-            if not why and pos.get("sl_id"):
-                info = ex.fetch_order(pos["sl_id"], symbol)
-                if info and info.get("status") in ("closed","canceled"):
-                    why = "SL(Exch)" if info.get("filled",0)>0 else None
+            tz = zoneinfo.ZoneInfo(tzname)
         except Exception:
-            pass
-
-    if not why:
-        return
-
-    # cierre: cancela hermanas y manda reduceOnly para asegurar cierre total
-    notional_entry = pos["entry"] * pos["qty"]
-    notional_exit = price * pos["qty"]
-    entry_fee = pos.get("entry_fee", compute_fee(notional_entry))
-    exit_fee = compute_fee(notional_exit)
-    gross = (price - pos["entry"]) * pos["qty"] * (1 if side=="long" else -1)
-    pnl = gross - (entry_fee + exit_fee)
-
-    if CONFIG["LIVE"]:
-        try:
-            cancel_if_exists(ex, pos.get("tp_id"), symbol)
-            cancel_if_exists(ex, pos.get("sl_id"), symbol)
-            side_ccxt = "sell" if side=="long" else "buy"
-            ex.create_order(symbol, "market", side_ccxt, pos["qty"], None, {"reduceOnly": True})
-        except Exception as e:
-            print(f"[{ts()}] [CLOSE/ERR] {symbol} {mode} {side} -> {e}")
-
-    # stats
-    stats_on_close(STATS, pnl, (entry_fee+exit_fee), notional_exit)
-    save_stats(STATS)
-
-    # telegram
-    try:
-        if notifier and notifier.enabled():
-            notifier.send_trade_close_rich_futures(
-                symbol=symbol, mode=mode, side=side, reason=why,
-                gross=gross, fees=(entry_fee+exit_fee), pnl=pnl,
-                entry=pos["entry"], qty=pos["qty"], hold_sec=time.time()-pos["opened_at"]
-            )
-        else:
-            tg(f"[CLOSE {why}] {symbol} {mode} {side} pnl={pnl:+.4f}")
-    except Exception: pass
-
-    if pnl < 0:
-        last_loss_time[key] = time.time()
-
-    positions.pop(key, None)
-    save_json(POSITIONS_FILE, {"positions": {f"{s}|{m}|{d}":v for (s,m,d),v in positions.items()}})
-
-# -------------------- Señales RSI --------------------
-def rsi_state_update(symbol: str, rsi_val: float):
-    prev = rsi_state.get(symbol, "mid")
-    th_buy = CONFIG["RSI_BUY_THRESHOLD"]
-    th_sell = CONFIG["RSI_SELL_THRESHOLD"]
-    hyst = CONFIG["RSI_HYSTERESIS"]
-
-    new_state = prev
-    if rsi_val < th_buy: new_state = "below"
-    elif rsi_val > th_sell: new_state = "above"
+            tz = timezone.utc
     else:
-        if prev == "below" and rsi_val > th_buy + hyst: new_state = "mid"
-        elif prev == "above" and rsi_val < th_sell - hyst: new_state = "mid"
-    rsi_state[symbol] = new_state
-    return prev, new_state
+        tz = timezone.utc
+    return datetime.now(tz)
 
-# -------------------- Boot summary --------------------
-def boot_summary() -> str:
-    return (
-        f"[{ts()}] [BOOT] EXCHANGE={CONFIG['EXCHANGE']} TYPE={CONFIG['MARKET_TYPE']} LIVE={CONFIG['LIVE']} TZ={CONFIG['TIMEZONE']}\n"
-        f"TF={CONFIG['TIMEFRAME']} Symbols={','.join(CONFIG['SYMBOLS'])}\n"
-        f"RSI(p={CONFIG['RSI_PERIOD']}, buy<{CONFIG['RSI_BUY_THRESHOLD']}, sell>{CONFIG['RSI_SELL_THRESHOLD']}) Hyst={CONFIG['RSI_HYSTERESIS']}\n"
-        f"TP/SL A={CONFIG['TP_PCT_A']}/{CONFIG['SL_PCT_A']}%  M={CONFIG['TP_PCT_M']}/{CONFIG['SL_PCT_M']}%  C={CONFIG['TP_PCT_C']}/{CONFIG['SL_PCT_C']}%\n"
-        f"Cooldown={CONFIG['SIGNAL_COOLDOWN']}s  Timeout={CONFIG['TIMEOUT_MIN']}m  LossCD={CONFIG['LOSS_COOLDOWN_SEC']}s  FeeRate={CONFIG['FEE_RATE']}\n"
-        f"Leverage={CONFIG['LEVERAGE']}x  MarginMode={CONFIG['MARGIN_MODE']}\n"
-        f"Caps A={CONFIG['CAPITAL_AGRESIVO']}/x{CONFIG['LOT_SIZE_AGRESIVO']}, M={CONFIG['CAPITAL_MODERADO']}/x{CONFIG['LOT_SIZE_MODERADO']}, C={CONFIG['CAPITAL_CONSERVADOR']}/x{CONFIG['LOT_SIZE_CONSERVADOR']}\n"
-        f"Keys api={_redact(CONFIG['API_KEY'])} secret={_redact(CONFIG['API_SECRET'])}"
+# ---------------------------
+# Configuración por entorno
+# ---------------------------
+EXCHANGE_ID = getenv_str("EXCHANGE", "coinex").lower()
+LIVE = getenv_int("LIVE", 0)  # 0 = demo (local), 1 = live (exchange)
+TIMEFRAME = getenv_str("TIMEFRAME", "1m")
+SYMBOLS = [s.strip() for s in getenv_str("SYMBOLS", "BTC/USDT,ETH/USDT").split(",") if s.strip()]
+FEE_RATE = getenv_float("FEE_RATE", 0.002)  # 0.2% por lado
+
+RSI_PERIOD = getenv_int("RSI_PERIOD", 14)
+RSI_BUY_TH = getenv_float("RSI_BUY_THRESHOLD", 30.0)
+RSI_SELL_TH = getenv_float("RSI_SELL_THRESHOLD", 70.0)
+RSI_HYST = getenv_float("RSI_HYSTERESIS", 3.0)
+
+# Estilo Saffex base
+TP_PCT = getenv_float("TAKE_PROFIT_PCT", 1.0)      # %
+SL_PCT = getenv_float("STOP_LOSS_PCT", 1.2)        # %
+
+# Mejoras
+TP_PARTIAL_PCT = getenv_float("TP_PARTIAL_PCT", 40.0)   # % de la posición
+ENABLE_BE = getenv_int("ENABLE_BREAKEVEN", 1) == 1
+BE_TRIGGER_PCT = getenv_float("BE_TRIGGER_PCT", 0.60)   # %
+BE_OFFSET_PCT = getenv_float("BE_OFFSET_PCT", 0.05)     # %
+
+ENABLE_TRAIL = getenv_int("ENABLE_TRAIL", 1) == 1
+TRAIL_TRIGGER_PCT = getenv_float("TRAIL_TRIGGER_PCT", 1.00)  # %
+TRAIL_STEP_PCT = getenv_float("TRAIL_STEP_PCT", 0.25)         # %
+
+SIGNAL_COOLDOWN = getenv_int("SIGNAL_COOLDOWN", 300)    # sec
+TIMEOUT_MIN = getenv_int("TIMEOUT_MIN", 25)             # min
+LOSS_COOLDOWN_SEC = getenv_int("LOSS_COOLDOWN_SEC", 900)
+
+# Caps y lotes (estilo Saffex) + tope automático por modo
+CAP_A = min(getenv_float("CAPITAL_AGRESIVO", 3.0), 50.0)
+LOTS_A = max(1, getenv_int("LOT_SIZE_AGRESIVO", 3))
+CAP_M = min(getenv_float("CAPITAL_MODERADO", 5.0), 500.0)
+LOTS_M = max(1, getenv_int("LOT_SIZE_MODERADO", 4))
+CAP_C = min(getenv_float("CAPITAL_CONSERVADOR", 7.0), 10000.0)
+LOTS_C = max(1, getenv_int("LOT_SIZE_CONSERVADOR", 5))
+
+# Telegram
+TELEGRAM_TOKEN = getenv_str("TELEGRAM_TOKEN", "")
+TELEGRAM_ALLOWED_IDS = [i.strip() for i in getenv_str("TELEGRAM_ALLOWED_IDS", "").split(",") if i.strip()]
+
+# Loop timings
+POLL_SEC = getenv_int("POLL_SEC", 5)
+
+# ---------------------------
+# Logging
+# ---------------------------
+logging.basicConfig(
+    level=logging.INFO,
+    format="[{asctime}] [{levelname}] {message}",
+    style="{",
+    datefmt="%Y-%m-%d %H:%M:%S%z",
+)
+log = logging.getLogger("bot")
+
+# ---------------------------
+# Telegram notifier
+# ---------------------------
+notifier = TelegramNotifier(
+    token=TELEGRAM_TOKEN,
+    allowed_chat_ids=TELEGRAM_ALLOWED_IDS
+)
+
+def fmt_price(x, tick_size=None):
+    if x is None:
+        return "n/a"
+    if tick_size and tick_size >= 1:
+        return f"{x:,.0f}"
+    # fallback genérico
+    return f"{x:,.4f}"
+
+# ---------------------------
+# Exchange / Mercado
+# ---------------------------
+def is_swap_symbol(market) -> bool:
+    # En ccxt coinex, los mercados swap suelen venir con type='swap'
+    if not market:
+        return False
+    t = market.get("type")
+    return t == "swap"
+
+def build_exchange():
+    kwargs = {
+        "enableRateLimit": True,
+        "options": {}
+    }
+    # Si quieres operar swap por defecto, puedes setear 'defaultType': 'swap'
+    # pero como tenemos símbolos spot y/o demo, lo dejamos neutro.
+    ex_class = getattr(ccxt, EXCHANGE_ID)
+    exchange = ex_class(kwargs)
+    # Si tienes API (solo para LIVE=1)
+    api_key = os.getenv("API_KEY")
+    api_secret = os.getenv("API_SECRET")
+    if LIVE == 1 and api_key and api_secret:
+        exchange.apiKey = api_key
+        exchange.secret = api_secret
+    return exchange
+
+exchange = build_exchange()
+markets = {}
+try:
+    markets = exchange.load_markets()
+except Exception as e:
+    log.warning(f"No se pudieron cargar mercados: {e}")
+
+# ---------------------------
+# Estrategia: RSI simple
+# ---------------------------
+def rsi(values, period=14):
+    """
+    RSI simple (Wilder) sobre lista de precios de cierre.
+    """
+    if len(values) <= period:
+        return None
+    gains = []
+    losses = []
+    for i in range(1, len(values)):
+        ch = values[i] - values[i - 1]
+        gains.append(max(ch, 0.0))
+        losses.append(max(-ch, 0.0))
+    # Suavizado Wilder
+    avg_gain = sum(gains[:period]) / period
+    avg_loss = sum(losses[:period]) / period
+    if period >= len(values) - 1:
+        return None
+    for i in range(period, len(values) - 1):
+        avg_gain = (avg_gain * (period - 1) + gains[i]) / period
+        avg_loss = (avg_loss * (period - 1) + losses[i]) / period
+    if avg_loss == 0:
+        return 100.0
+    rs = avg_gain / avg_loss
+    return 100.0 - (100.0 / (1 + rs))
+
+def fetch_price_and_rsi(symbol: str):
+    """
+    Obtiene último precio (bid/ask/last) y RSI del timeframe configurado.
+    """
+    try:
+        ohlcv = exchange.fetch_ohlcv(symbol, timeframe=TIMEFRAME, limit=max(200, RSI_PERIOD + 50))
+        closes = [c[4] for c in ohlcv]
+        last_close = closes[-1]
+        the_rsi = rsi(closes, RSI_PERIOD)
+        return float(last_close), float(the_rsi) if the_rsi is not None else None
+    except Exception as e:
+        log.warning(f"fetch_ohlcv fallo {symbol}: {e}")
+        # Fallback a ticker
+        try:
+            t = exchange.fetch_ticker(symbol)
+            last = t.get("last") or t.get("close")
+            return float(last), None
+        except Exception as e2:
+            log.error(f"fetch_ticker fallo {symbol}: {e2}")
+            return None, None
+
+# ---------------------------
+# Estado y posiciones (demo/local)
+# ---------------------------
+class Position:
+    def __init__(self, symbol, mode, side, qty, entry, tp, sl, opened_ts, notional):
+        self.symbol = symbol
+        self.mode = mode  # 'agresivo'|'moderado'|'conservador'
+        self.side = side  # 'long'|'short'
+        self.qty = qty
+        self.entry = entry
+        self.tp = tp
+        self.sl = sl
+        self.opened_ts = opened_ts
+        self.notional = notional
+        self.closed = False
+        self.closed_ts = None
+        self.reason = ""
+        self.partial_done = False
+        self.partial_size = 0.0
+        self.be_armed = False
+        self.trail_armed = False
+        self.trail_stop = None
+
+    def __repr__(self):
+        return f"<Pos {self.symbol} {self.mode} {self.side} qty={self.qty} @ {self.entry}>"
+
+positions = {}  # key: (symbol, mode) -> Position or None
+last_signal_ts = {}  # key: (symbol, mode, side) to enforce cooldown
+last_loss_ts = 0
+
+pnl_counters = {
+    "trades": 0,
+    "wins": 0,
+    "losses": 0,
+    "gross": 0.0,
+    "fees": 0.0,
+    "pnl": 0.0
+}
+last_summary_ts = time.time()
+
+MODES = [
+    ("agresivo", CAP_A, LOTS_A),
+    ("moderado", CAP_M, LOTS_M),
+    ("conservador", CAP_C, LOTS_C),
+]
+
+def mode_multiplier(mode: str) -> int:
+    if mode == "agresivo":
+        return 3
+    if mode == "moderado":
+        return 4
+    return 5  # conservador
+
+def per_lot_cap(cap: float, lots: int) -> float:
+    lots = max(1, lots)
+    return cap / float(lots)
+
+def compute_order_qty(symbol: str, dollar_size: float, price: float):
+    """
+    Cantidad (base) ≈ notional / price (redondeo simple a 6 decimales)
+    """
+    if price <= 0:
+        return 0.0
+    qty = dollar_size / price
+    return float(round(qty, 6))
+
+def compute_tp_sl(side: str, entry: float, tp_pct: float, sl_pct: float):
+    if side == "long":
+        tp = entry * (1.0 + tp_pct / 100.0)
+        sl = entry * (1.0 - sl_pct / 100.0)
+    else:
+        tp = entry * (1.0 - tp_pct / 100.0)
+        sl = entry * (1.0 + sl_pct / 100.0)
+    return tp, sl
+
+def price_hit_take(side: str, price: float, tp: float) -> bool:
+    if side == "long":
+        return price >= tp
+    return price <= tp
+
+def price_hit_stop(side: str, price: float, sl: float) -> bool:
+    if side == "long":
+        return price <= sl
+    return price >= sl
+
+def unrealized_pct(side: str, price: float, entry: float) -> float:
+    if entry <= 0:
+        return 0.0
+    change = (price - entry) / entry * 100.0
+    return change if side == "long" else (-change)
+
+def maybe_arm_be_and_trail(pos: Position, price: float):
+    if ENABLE_BE and not pos.be_armed:
+        if unrealized_pct(pos.side, price, pos.entry) >= BE_TRIGGER_PCT:
+            # mover SL a BE + offset
+            if pos.side == "long":
+                pos.sl = pos.entry * (1.0 + BE_OFFSET_PCT / 100.0)
+            else:
+                pos.sl = pos.entry * (1.0 - BE_OFFSET_PCT / 100.0)
+            pos.be_armed = True
+    if ENABLE_TRAIL and not pos.trail_armed:
+        if unrealized_pct(pos.side, price, pos.entry) >= TRAIL_TRIGGER_PCT:
+            # arrancamos trailing: fijamos un primer stop dinámico
+            if pos.side == "long":
+                pos.trail_stop = price * (1.0 - TRAIL_STEP_PCT / 100.0)
+            else:
+                pos.trail_stop = price * (1.0 + TRAIL_STEP_PCT / 100.0)
+            pos.trail_armed = True
+    if ENABLE_TRAIL and pos.trail_armed and pos.trail_stop is not None:
+        # actualizar trailing si se aleja a favor
+        if pos.side == "long":
+            new_stop = price * (1.0 - TRAIL_STEP_PCT / 100.0)
+            if new_stop > pos.trail_stop:
+                pos.trail_stop = new_stop
+        else:
+            new_stop = price * (1.0 + TRAIL_STEP_PCT / 100.0)
+            if new_stop < pos.trail_stop:
+                pos.trail_stop = new_stop
+
+def hit_trailing_exit(pos: Position, price: float) -> bool:
+    if not (ENABLE_TRAIL and pos.trail_armed and pos.trail_stop):
+        return False
+    if pos.side == "long":
+        return price <= pos.trail_stop
+    else:
+        return price >= pos.trail_stop
+
+def place_open_order_live(symbol, side, qty):
+    """
+    Para LIVE=1: ejecuta market order (simple). En spot CoinEx no hay setLeverage/margin.
+    En swap, solo se llama leverage/margin si el mercado es swap.
+    """
+    mkt = markets.get(symbol)
+    try:
+        if mkt and is_swap_symbol(mkt):
+            # set leverage/margin SOLO si el mercado es swap
+            try:
+                if hasattr(exchange, "set_margin_mode") and exchange.has.get("setMarginMode"):
+                    exchange.set_margin_mode("cross", symbol)
+            except Exception:
+                pass
+            try:
+                if hasattr(exchange, "set_leverage") and exchange.has.get("setLeverage"):
+                    exchange.set_leverage(3, symbol)  # valor fijo o configurable
+            except Exception:
+                pass
+        params = {}
+        side_ccxt = "buy" if side == "long" else "sell"
+        order = exchange.create_order(symbol, type="market", side=side_ccxt, amount=qty, params=params)
+        return order
+    except Exception as e:
+        log.error(f"create_order fallo {symbol} {side} qty={qty}: {e}")
+        return None
+
+def close_order_live(symbol, side, qty):
+    """
+    Cierre en LIVE: usa market en sentido inverso si es spot;
+    si es swap con position mode, ideal sería reduceOnly, aquí lo simplificamos.
+    """
+    try:
+        side_ccxt = "sell" if side == "long" else "buy"
+        order = exchange.create_order(symbol, type="market", side=side_ccxt, amount=qty, params={})
+        return order
+    except Exception as e:
+        log.error(f"close_order fallo {symbol} {side} qty={qty}: {e}")
+        return None
+
+def fee_cost(notional: float) -> float:
+    # ida y vuelta aproximada
+    return notional * (FEE_RATE * 2.0)
+
+def record_close(pos: Position, close_price: float, reason: str):
+    """
+    Calcula PnL neto aproximado con fees ida y vuelta.
+    """
+    pos.closed = True
+    pos.closed_ts = time.time()
+    pos.reason = reason
+
+    # Notional "efectivo": si hubo TP parcial, consideramos toda la notional
+    # para fees ida/vuelta (aprox), y PnL por porcentaje sobre notional.
+    # Es simple y consistente con las notificaciones anteriores.
+    side = pos.side
+    entry = pos.entry
+    notional = pos.notional
+    # Ganancia/perdida bruta aproximada (en función del porcentaje alcanzado)
+    # Si reason es TP parcial/TP/trail, estimamos por distancia entrada->close
+    ret_pct = (close_price - entry) / entry * 100.0
+    if side == "short":
+        ret_pct = -ret_pct
+    gross = notional * (ret_pct / 100.0)
+    fees = fee_cost(notional)
+    pnl = gross - fees
+
+    # Estadísticos
+    pnl_counters["trades"] += 1
+    pnl_counters["gross"] += gross
+    pnl_counters["fees"] += fees
+    pnl_counters["pnl"] += pnl
+    if pnl >= 0:
+        pnl_counters["wins"] += 1
+    else:
+        pnl_counters["losses"] += 1
+
+    # Notificación de cierre
+    notifier.send_close(
+        symbol=pos.symbol,
+        mode=pos.mode.title(),
+        side=side.upper(),
+        reason=reason,
+        gross=gross,
+        fees=fees,
+        pnl=pnl,
+        duration_sec=int(pos.closed_ts - pos.opened_ts)
     )
 
-# -------------------- Main loop --------------------
+    return pnl
+
+def open_position(symbol: str, mode: str, side: str, lot_usd: float, price: float):
+    qty = compute_order_qty(symbol, lot_usd, price)
+    if qty <= 0:
+        return None
+
+    tp, sl = compute_tp_sl(side, price, TP_PCT, SL_PCT)
+    notional = lot_usd  # aproximamos notional = tamaño en $ por lote
+    pos = Position(
+        symbol=symbol, mode=mode, side=side, qty=qty,
+        entry=price, tp=tp, sl=sl, opened_ts=time.time(), notional=notional
+    )
+    positions[(symbol, mode)] = pos
+
+    # LIVE: intentar abrir en exchange
+    if LIVE == 1:
+        place_open_order_live(symbol, side, qty)
+
+    # Notificación apertura
+    notifier.send_open(
+        symbol=symbol,
+        mode=mode.title(),
+        side=side.upper(),
+        lots=mode_multiplier(mode),
+        entry=price,
+        sl=sl,
+        tp=tp,
+        rsi=None,  # se muestra abajo por debug si quieres
+        timeframe=TIMEFRAME,
+        size_usd=lot_usd,
+        qty=qty
+    )
+    return pos
+
+def try_close_logic(symbol: str, mode: str, price: float):
+    pos = positions.get((symbol, mode))
+    if not pos or pos.closed:
+        return
+
+    elapsed = time.time() - pos.opened_ts
+
+    # Mejoras: BE/Trailing
+    maybe_arm_be_and_trail(pos, price)
+
+    # 1) Trailing exit
+    if hit_trailing_exit(pos, price):
+        if LIVE == 1:
+            close_order_live(pos.symbol, pos.side, pos.qty)
+        record_close(pos, price, "TRAIL(Local)")
+        return
+
+    # 2) TP parcial: una sola vez
+    if not pos.partial_done and price_hit_take(pos.side, price, pos.tp):
+        # Cerrar porcentaje TP_PARTIAL_PCT
+        part_pct = max(0.0, min(TP_PARTIAL_PCT, 100.0)) / 100.0
+        if part_pct > 0.0:
+            close_qty = pos.qty * part_pct
+            if LIVE == 1:
+                close_order_live(pos.symbol, pos.side, close_qty)
+            pos.qty -= close_qty
+            pos.partial_done = True
+            pos.partial_size = close_qty
+            # mover SL a BE si no estaba
+            if ENABLE_BE and not pos.be_armed:
+                if pos.side == "long":
+                    pos.sl = pos.entry * (1.0 + BE_OFFSET_PCT / 100.0)
+                else:
+                    pos.sl = pos.entry * (1.0 - BE_OFFSET_PCT / 100.0)
+                pos.be_armed = True
+            # No cerramos del todo, dejamos correr el resto con trailing/BE
+            # Anunciar TP parcial como "TP(Local)" (parcial) para consistencia
+            notifier.send_partial_tp(
+                symbol=pos.symbol,
+                mode=pos.mode.title(),
+                side=pos.side.upper(),
+                partial_pct=TP_PARTIAL_PCT,
+                price=price
+            )
+
+    # 3) Stop Loss / BE SL
+    if price_hit_stop(pos.side, price, pos.sl):
+        if LIVE == 1:
+            close_order_live(pos.symbol, pos.side, pos.qty)
+        record_close(pos, price, "SL(Local)")
+        return
+
+    # 4) TIMEOUT
+    if elapsed >= TIMEOUT_MIN * 60:
+        if LIVE == 1:
+            close_order_live(pos.symbol, pos.side, pos.qty)
+        record_close(pos, price, "TIMEOUT(Local)")
+        return
+
+def signal_allowed(symbol: str, mode: str, side: str) -> bool:
+    global last_loss_ts
+    now_ts = time.time()
+    # Cooldown por lado y modo
+    key = (symbol, mode, side)
+    last_ts = last_signal_ts.get(key, 0)
+    if now_ts - last_ts < SIGNAL_COOLDOWN:
+        return False
+    # Cooldown por pérdida global
+    if last_loss_ts and (now_ts - last_loss_ts < LOSS_COOLDOWN_SEC):
+        return False
+    return True
+
+def mark_signal(symbol: str, mode: str, side: str):
+    last_signal_ts[(symbol, mode, side)] = time.time()
+
+def mark_loss_if_needed(pnl: float):
+    global last_loss_ts
+    if pnl < 0:
+        last_loss_ts = time.time()
+
+def maybe_open_trades(symbol: str, rsi_value: float, price: float):
+    # BUY si RSI < BUYT - hyst; SELL si RSI > SELLT + hyst
+    long_sig  = rsi_value is not None and (rsi_value < max(0.0, RSI_BUY_TH - RSI_HYST))
+    short_sig = rsi_value is not None and (rsi_value > min(100.0, RSI_SELL_TH + RSI_HYST))
+
+    for mode, cap, lots in MODES:
+        if cap <= 0:
+            continue
+        key = (symbol, mode)
+        pos = positions.get(key)
+        if pos and not pos.closed:
+            continue  # ya en mercado
+
+        lot_usd = per_lot_cap(cap, lots)
+        if lot_usd <= 0:
+            continue
+
+        if long_sig and signal_allowed(symbol, mode, "long"):
+            open_position(symbol, mode, "long", lot_usd, price)
+            mark_signal(symbol, mode, "long")
+
+        elif short_sig and signal_allowed(symbol, mode, "short"):
+            open_position(symbol, mode, "short", lot_usd, price)
+            mark_signal(symbol, mode, "short")
+
+def heartbeat_summary():
+    global last_summary_ts
+    now_ts = time.time()
+    if now_ts - last_summary_ts >= 3600:  # cada 1h
+        notifier.send_totals(
+            trades=pnl_counters["trades"],
+            wins=pnl_counters["wins"],
+            losses=pnl_counters["losses"],
+            pnl=pnl_counters["pnl"],
+            fees=pnl_counters["fees"],
+            gross=pnl_counters["gross"]
+        )
+        last_summary_ts = now_ts
+
+# ---------------------------
+# Señales del sistema
+# ---------------------------
+_running = True
+def handle_sigterm(signum, frame):
+    global _running
+    _running = False
+    log.info("[STOP] Señal de apagado recibida; cerrando loop…")
+
+signal.signal(signal.SIGTERM, handle_sigterm)
+signal.signal(signal.SIGINT, handle_sigterm)
+
+# ---------------------------
+# Arranque
+# ---------------------------
+def boot_banner():
+    caps = f"A {CAP_A}/x{mode_multiplier('agresivo')} · M {CAP_M}/x{mode_multiplier('moderado')} · C {CAP_C}/x{mode_multiplier('conservador')}"
+    mode_txt = "LIVE" if LIVE == 1 else "PAPER 🧪"
+    txt = (
+        f"🚀 INICIO DEL BOT\n\n"
+        f"🧩 Exchange: {EXCHANGE_ID} | Modo: {mode_txt}\n"
+        f"⏰ Timeframe: {TIMEFRAME}\n"
+        f"🧪 Estrategia: RSI({RSI_PERIOD}) — Buy < {RSI_BUY_TH} / Sell > {RSI_SELL_TH}\n"
+        f"🎯 TP/SL (base): {TP_PCT:.2f}% / {SL_PCT:.2f}%\n"
+        f"🔧 BE: {('On' if ENABLE_BE else 'Off')} @ {BE_TRIGGER_PCT:.2f}% (+{BE_OFFSET_PCT:.2f}%) · "
+        f"Trail: {('On' if ENABLE_TRAIL else 'Off')} @ {TRAIL_TRIGGER_PCT:.2f}% (step {TRAIL_STEP_PCT:.2f}%)\n"
+        f"⛓️ Cooldown: {SIGNAL_COOLDOWN}s | ⏱️ Timeout: {TIMEOUT_MIN}m | 🧊 LossCD: {LOSS_COOLDOWN_SEC}s\n"
+        f"📦 Símbolos: {', '.join(SYMBOLS)}\n"
+        f"💰 Caps: {caps}\n"
+    )
+    notifier.broadcast(txt)
+
 def main():
-    global STATS, RUNNING
+    boot_banner()
 
-    signal.signal(signal.SIGTERM, signal_handler)
-    signal.signal(signal.SIGINT, signal_handler)
+    # Mensaje al log con llaves deforma resumida (si existen)
+    api_key = os.getenv("API_KEY", "")
+    api_secret = os.getenv("API_SECRET", "")
+    def mask(s):
+        if not s:
+            return ""
+        if len(s) < 7:
+            return "***"
+        return f"{s[:3]}...{s[-3:]}"
+    log.info(f"Keys api={mask(api_key)} secret={mask(api_secret)}")
 
-    STATS = load_stats()
-
-    # restaurar posiciones (nota: ids de órdenes de exchange se pierden tras reinicio)
-    persisted = load_json(POSITIONS_FILE, {}).get("positions", {})
-    for k, v in persisted.items():
+    # Loop principal
+    global _running
+    while _running:
         try:
-            s, m, d = k.split("|", 2)
-            positions[(s, m, d)] = v
-            # limpia ids porque tras reinicio no sabemos su estado
-            positions[(s, m, d)]["tp_id"] = None
-            positions[(s, m, d)]["sl_id"] = None
-        except Exception:
-            pass
+            for symbol in SYMBOLS:
+                price, rsi_val = fetch_price_and_rsi(symbol)
+                if price is None:
+                    continue
 
-    ex = build_exchange()
-    _ = load_markets_retry(ex)
+                log.debug(f"{symbol} | Precio: {price:.2f} | RSI: {rsi_val:.2f}" if rsi_val is not None else f"{symbol} | Precio: {price:.2f} | RSI: n/a")
 
-    for sym in CONFIG["SYMBOLS"]:
-        try:
-            set_symbol_leverage_and_mode(ex, sym)
-        except Exception: pass
+                # Cierres/gestión
+                for mode, _, _ in MODES:
+                    try_close_logic(symbol, mode, price)
 
-    try:
-        if notifier and notifier.enabled():
-            notifier.send_totals_rich(trades=STATS["trades"], wins=STATS["wins"], losses=STATS["losses"],
-                                      pnl=STATS["pnl"], fees=STATS["fees"], volume=STATS["volume"], balance=STATS["balance"])
-            notifier.send_boot_rich(live=CONFIG["LIVE"], exchange=f"{CONFIG['EXCHANGE']}({CONFIG['MARKET_TYPE']})",
-                                    timeframe=CONFIG["TIMEFRAME"], symbols=",".join(CONFIG["SYMBOLS"]),
-                                    rsi_p=CONFIG["RSI_PERIOD"], rsi_th=CONFIG["RSI_BUY_THRESHOLD"],
-                                    tp_pct=CONFIG["TP_PCT"], sl_pct=CONFIG["SL_PCT"],
-                                    cooldown_s=CONFIG["SIGNAL_COOLDOWN"], timeout_m=CONFIG["TIMEOUT_MIN"], loss_cd_s=CONFIG["LOSS_COOLDOWN_SEC"],
-                                    cap_a=CONFIG["CAPITAL_AGRESIVO"], lot_a=CONFIG["LOT_SIZE_AGRESIVO"],
-                                    cap_m=CONFIG["CAPITAL_MODERADO"], lot_m=CONFIG["LOT_SIZE_MODERADO"],
-                                    cap_c=CONFIG["CAPITAL_CONSERVADOR"], lot_c=CONFIG["LOT_SIZE_CONSERVADOR"])
-    except Exception as _e:
-        print(f"[{ts()}] [WARN] boot telegram: {_e}]")
+                # Aberturas
+                maybe_open_trades(symbol, rsi_val if rsi_val is not None else 50.0, price)
 
-    while RUNNING:
-        loop_start = time.time()
+            heartbeat_summary()
+            time.sleep(POLL_SEC)
 
-        # cerrar si corresponde
-        for key in list(positions.keys()):
-            try:
-                maybe_close_one(ex, key)
-            except Exception as e:
-                print(f"[{ts()}] [CLOSE/WARN] {key} -> {e}")
+        except Exception as e:
+            log.error(f"Loop error: {e}")
+            time.sleep(2)
 
-        # señales
-        for symbol in CONFIG["SYMBOLS"]:
-            try:
-                last_sig = last_signal_time.get(symbol, 0.0)
-                closes = fetch_closes(ex, symbol, CONFIG["TIMEFRAME"], limit=max(200, CONFIG["RSI_PERIOD"]+50))
-                rsi = rsi_wilder(closes, CONFIG["RSI_PERIOD"])
-                if rsi is None: continue
-                price = closes[-1]
-                prev, new = rsi_state_update(symbol, rsi)
-
-                if time.time() - last_sig >= CONFIG["SIGNAL_COOLDOWN"]:
-                    if prev != "below" and new == "below":
-                        ctx = f"(RSI={rsi:.2f} < {CONFIG['RSI_BUY_THRESHOLD']})"
-                        for mode in ("agresivo","moderado","conservador"):
-                            open_position(ex, symbol, mode, "long", ctx)
-                        last_signal_time[symbol] = time.time()
-
-                    if prev != "above" and new == "above":
-                        ctx = f"(RSI={rsi:.2f} > {CONFIG['RSI_SELL_THRESHOLD']})"
-                        for mode in ("agresivo","moderado","conservador"):
-                            open_position(ex, symbol, mode, "short", ctx)
-                        last_signal_time[symbol] = time.time()
-
-            except Exception as e:
-                print(f"[{ts()}] [LOOP/WARN] {symbol} -> {e}")
-
-        try:
-            maybe_send_summary()
-        except Exception:
-            pass
-
-        elapsed = time.time() - loop_start
-        time.sleep(max(1.0 - elapsed, 0.1))
+    log.info("[EXIT] Loop detenido.")
 
 if __name__ == "__main__":
     main()
