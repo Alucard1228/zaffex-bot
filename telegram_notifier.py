@@ -65,22 +65,22 @@ class TelegramNotifier:
         self._post(text)
 
     def send_open(self, symbol, mode, side, lots, entry, sl, tp, timeframe, size_usd, qty, rsi_value=None, take_profit_pct=None, stop_loss_pct=None):
-    rr = TPtoSL(entry, tp, sl)
-    rsi_txt = f"{rsi_value:.1f}" if rsi_value is not None else "n/a"
-    tp_pct = f"{take_profit_pct:.1f}%" if take_profit_pct is not None else "n/a"
-    sl_pct = f"{stop_loss_pct:.1f}%" if stop_loss_pct is not None else "n/a"
-    text = (
-        f"⚡ <b>NUEVA POSICIÓN</b>\n"
-        f"{'🟢' if side == 'LONG' else '🔴'} <b>{side}</b> | {symbol}\n\n"
-        f"📊 <b>Modo:</b> {mode} ({lots} lotes)\n"
-        f"💰 <b>Capital:</b> ${size_usd:,.2f}\n"
-        f"📈 <b>Entrada:</b> ${entry:,.4f}\n"
-        f"✅ <b>TP:</b> ${tp:,.4f} ({tp_pct})\n"
-        f"🛑 <b>SL:</b> ${sl:,.4f} ({sl_pct})\n"
-        f"⚖️ <b>R:R</b> = 1:{rr:.1f}\n"
-        f"🕒 <b>TF:</b> {timeframe} | RSI: {rsi_txt}\n"
-    )
-    self._post(text)
+        rr = TPtoSL(entry, tp, sl)
+        rsi_txt = f"{rsi_value:.1f}" if rsi_value is not None else "n/a"
+        tp_pct = f"{take_profit_pct:.1f}%" if take_profit_pct is not None else "n/a"
+        sl_pct = f"{stop_loss_pct:.1f}%" if stop_loss_pct is not None else "n/a"
+        text = (
+            f"⚡ <b>NUEVA POSICIÓN</b>\n"
+            f"{'🟢' if side == 'LONG' else '🔴'} <b>{side}</b> | {symbol}\n\n"
+            f"📊 <b>Modo:</b> {mode} ({lots} lotes)\n"
+            f"💰 <b>Capital:</b> ${size_usd:,.2f}\n"
+            f"📈 <b>Entrada:</b> ${entry:,.4f}\n"
+            f"✅ <b>TP:</b> ${tp:,.4f} ({tp_pct})\n"
+            f"🛑 <b>SL:</b> ${sl:,.4f} ({sl_pct})\n"
+            f"⚖️ <b>R:R</b> = 1:{rr:.1f}\n"
+            f"🕒 <b>TF:</b> {timeframe} | RSI: {rsi_txt}\n"
+        )
+        self._post(text)
 
     def send_partial_tp(self, symbol, mode, side, partial_pct, price):
         text = (
