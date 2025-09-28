@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
 """
-Bot Zaffex - Réplica exacta + Resumen horario y capital en tiempo real
+Bot Zaffex - Réplica exacta + Resumen horario, capital en tiempo real y logs de diagnóstico
 """
 
 import os
@@ -117,7 +117,7 @@ notifier = TelegramNotifier(
 )
 
 # ---------------------------
-# Exchange y RSI (igual que antes)
+# Exchange y RSI
 # ---------------------------
 def is_swap_symbol(market) -> bool:
     if not market:
@@ -208,10 +208,8 @@ positions = {}
 last_signal_ts = {}
 last_loss_ts = 0
 
-# Contadores globales
 pnl_counters = {"trades": 0, "wins": 0, "losses": 0, "gross": 0.0, "fees": 0.0, "pnl": 0.0}
 
-# Capital y métricas horarias
 current_capital = INITIAL_CAPITAL
 hourly_stats = {
     "start_time": time.time(),
@@ -339,10 +337,8 @@ def record_close(pos: Position, close_price: float, reason: str):
     fees = fee_cost(notional)
     pnl = gross - fees
 
-    # Actualizar capital global
     current_capital += pnl
 
-    # Contadores globales
     pnl_counters["trades"] += 1
     pnl_counters["gross"] += gross
     pnl_counters["fees"] += fees
@@ -353,7 +349,6 @@ def record_close(pos: Position, close_price: float, reason: str):
         pnl_counters["losses"] += 1
         last_loss_ts = time.time()
 
-    # Métricas horarias
     hourly_stats["trades"] += 1
     if pnl >= 0:
         hourly_stats["wins"] += 1
@@ -361,7 +356,6 @@ def record_close(pos: Position, close_price: float, reason: str):
         hourly_stats["losses"] += 1
     hourly_stats["pnl"] += pnl
 
-    # Notificación
     notifier.send_close(
         symbol=pos.symbol,
         mode=pos.mode.title(),
@@ -531,9 +525,11 @@ def main():
     api_key = os.getenv("API_KEY", "")
     def mask(s): return f"{s[:3]}...{s[-3:]}" if s and len(s) > 6 else "***"
     log.info(f"API key: {mask(api_key)}")
+    log.info("✅ Bot iniciado correctamente. Entrando al bucle principal...")  # ← LOG DE DIAGNÓSTICO
 
     global _running
     while _running:
+        log.info("🔄 Bucle activo: consultando precios y RSI...")  # ← LOG DE DIAGNÓSTICO (solo para pruebas)
         try:
             for symbol in SYMBOLS:
                 price, rsi_val = fetch_price_and_rsi(symbol)
@@ -551,5 +547,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-
-
