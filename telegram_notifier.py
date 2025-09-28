@@ -31,9 +31,6 @@ def TPtoSL(entry: float, tp: float, sl: float) -> float:
     return round(up / dn, 1)
 
 class TelegramNotifier:
-    """
-    Notificador para Telegram usando la API HTTP directamente.
-    """
     def __init__(self, token: str = "", allowed_chat_ids=None, **kwargs):
         self.token = token or ""
         self.allowed = []
@@ -43,7 +40,7 @@ class TelegramNotifier:
                     self.allowed.append(int(str(cid).strip()))
                 except Exception:
                     pass
-        # 🔧 CORREGIDO: sin espacios después de 'bot'
+        # 🔧 CORREGIDO: URL sin espacios
         self.api = f"https://api.telegram.org/bot{self.token}" if self.token else ""
         self.session = requests.Session() if self.token else None
 
