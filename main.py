@@ -1,12 +1,6 @@
 # -*- coding: utf-8 -*-
 """
-Bot Zaffex - Réplica exacta del comportamiento observado
-- Timeframe: 1m
-- RSI(14): compra < 30, venta > 70
-- TP = 1.5%, SL = 1.0%
-- Modos: Agresivo, Moderado, Conservador (cada uno con límite, pero comparten balance real en la práctica)
-- Soporta largo y corto (requiere futuros/swap)
-- Fees ajustados a CoinEx Futures: 0.05% por lado
+Bot Zaffex - Réplica exacta + Resumen horario y capital en tiempo real
 """
 
 import os
@@ -60,21 +54,21 @@ def now_tz():
     return datetime.now(tz)
 
 # ---------------------------
-# Configuración por entorno
+# Configuración
 # ---------------------------
 EXCHANGE_ID = getenv_str("EXCHANGE", "coinex").lower()
 LIVE = getenv_int("LIVE", 0)
 TIMEFRAME = getenv_str("TIMEFRAME", "1m")
 SYMBOLS = [s.strip() for s in getenv_str("SYMBOLS", "BTC/USDT:USDT,ETH/USDT:USDT").split(",") if s.strip()]
-FEE_RATE = getenv_float("FEE_RATE", 0.0005)  # 0.05% por lado (futuros CoinEx)
+FEE_RATE = getenv_float("FEE_RATE", 0.0005)
 
 RSI_PERIOD = getenv_int("RSI_PERIOD", 14)
 RSI_BUY_THRESHOLD = getenv_float("RSI_BUY_THRESHOLD", 30.0)
 RSI_SELL_THRESHOLD = getenv_float("RSI_SELL_THRESHOLD", 70.0)
 RSI_HYST = getenv_float("RSI_HYSTERESIS", 3.0)
 
-TAKE_PROFIT_PCT = getenv_float("TAKE_PROFIT_PCT", 1.5)  # %
-STOP_LOSS_PCT = getenv_float("STOP_LOSS_PCT", 1.0)      # %
+TAKE_PROFIT_PCT = getenv_float("TAKE_PROFIT_PCT", 1.5)
+STOP_LOSS_PCT = getenv_float("STOP_LOSS_PCT", 1.0)
 
 TP_PARTIAL_PCT = getenv_float("TP_PARTIAL_PCT", 40.0)
 ENABLE_BE = getenv_int("ENABLE_BREAKEVEN", 1) == 1
@@ -89,7 +83,6 @@ SIGNAL_COOLDOWN = getenv_int("SIGNAL_COOLDOWN", 300)
 TIMEOUT_MIN = getenv_int("TIMEOUT_MIN", 25)
 LOSS_COOLDOWN_SEC = getenv_int("LOSS_COOLDOWN_SEC", 900)
 
-# --- LÍMITES POR MODO (como en Zaffex) ---
 CAP_A = min(getenv_float("CAPITAL_AGRESIVO", 20.0), 1000.0)
 LOTS_A = max(1, getenv_int("LOT_SIZE_AGRESIVO", 3))
 
@@ -99,11 +92,13 @@ LOTS_M = max(1, getenv_int("LOT_SIZE_MODERADO", 4))
 CAP_C = min(getenv_float("CAPITAL_CONSERVADOR", 20.0), 1000.0)
 LOTS_C = max(1, getenv_int("LOT_SIZE_CONSERVADOR", 5))
 
-# Telegram
 TELEGRAM_TOKEN = getenv_str("TELEGRAM_TOKEN", "")
 TELEGRAM_ALLOWED_IDS = [i.strip() for i in getenv_str("TELEGRAM_ALLOWED_IDS", "").split(",") if i.strip()]
 
 POLL_SEC = getenv_int("POLL_SEC", 5)
+
+# Capital inicial para paper trading
+INITIAL_CAPITAL = getenv_float("INITIAL_CAPITAL", 20.0)
 
 # ---------------------------
 # Logging
@@ -121,15 +116,8 @@ notifier = TelegramNotifier(
     allowed_chat_ids=TELEGRAM_ALLOWED_IDS
 )
 
-def fmt_price(x, tick_size=None):
-    if x is None:
-        return "n/a"
-    if tick_size and tick_size >= 1:
-        return f"{x:,.0f}"
-    return f"{x:,.4f}"
-
 # ---------------------------
-# Exchange
+# Exchange y RSI (igual que antes)
 # ---------------------------
 def is_swap_symbol(market) -> bool:
     if not market:
@@ -155,9 +143,6 @@ try:
 except Exception as e:
     log.warning(f"No se pudieron cargar mercados: {e}")
 
-# ---------------------------
-# RSI (Wilder)
-# ---------------------------
 def rsi(values, period=14):
     if len(values) <= period:
         return None
@@ -195,7 +180,7 @@ def fetch_price_and_rsi(symbol: str):
             return None, None
 
 # ---------------------------
-# Clase Position
+# Estado global
 # ---------------------------
 class Position:
     def __init__(self, symbol, mode, side, qty, entry, tp, sl, opened_ts, notional):
@@ -223,7 +208,19 @@ positions = {}
 last_signal_ts = {}
 last_loss_ts = 0
 
+# Contadores globales
 pnl_counters = {"trades": 0, "wins": 0, "losses": 0, "gross": 0.0, "fees": 0.0, "pnl": 0.0}
+
+# Capital y métricas horarias
+current_capital = INITIAL_CAPITAL
+hourly_stats = {
+    "start_time": time.time(),
+    "trades": 0,
+    "wins": 0,
+    "losses": 0,
+    "pnl": 0.0
+}
+
 last_summary_ts = time.time()
 
 MODES = [
@@ -323,9 +320,11 @@ def close_order_live(symbol, side, qty):
         return None
 
 def fee_cost(notional: float) -> float:
-    return notional * (FEE_RATE * 2.0)  # ida + vuelta
+    return notional * (FEE_RATE * 2.0)
 
 def record_close(pos: Position, close_price: float, reason: str):
+    global current_capital, hourly_stats, last_loss_ts
+
     pos.closed = True
     pos.closed_ts = time.time()
     pos.reason = reason
@@ -340,6 +339,10 @@ def record_close(pos: Position, close_price: float, reason: str):
     fees = fee_cost(notional)
     pnl = gross - fees
 
+    # Actualizar capital global
+    current_capital += pnl
+
+    # Contadores globales
     pnl_counters["trades"] += 1
     pnl_counters["gross"] += gross
     pnl_counters["fees"] += fees
@@ -348,9 +351,17 @@ def record_close(pos: Position, close_price: float, reason: str):
         pnl_counters["wins"] += 1
     else:
         pnl_counters["losses"] += 1
-        global last_loss_ts
         last_loss_ts = time.time()
 
+    # Métricas horarias
+    hourly_stats["trades"] += 1
+    if pnl >= 0:
+        hourly_stats["wins"] += 1
+    else:
+        hourly_stats["losses"] += 1
+    hourly_stats["pnl"] += pnl
+
+    # Notificación
     notifier.send_close(
         symbol=pos.symbol,
         mode=pos.mode.title(),
@@ -359,11 +370,14 @@ def record_close(pos: Position, close_price: float, reason: str):
         gross=gross,
         fees=fees,
         pnl=pnl,
-        duration_sec=int(pos.closed_ts - pos.opened_ts)
+        duration_sec=int(pos.closed_ts - pos.opened_ts),
+        entry=entry,
+        exit_price=close_price,
+        current_capital=current_capital
     )
     return pnl
 
-def open_position(symbol: str, mode: str, side: str, lot_usd: float, price: float):
+def open_position(symbol: str, mode: str, side: str, lot_usd: float, price: float, rsi_value=None):
     qty = compute_order_qty(symbol, lot_usd, price)
     if qty <= 0:
         return None
@@ -385,7 +399,8 @@ def open_position(symbol: str, mode: str, side: str, lot_usd: float, price: floa
         tp=tp,
         timeframe=TIMEFRAME,
         size_usd=lot_usd,
-        qty=qty
+        qty=qty,
+        rsi_value=rsi_value
     )
     return pos
 
@@ -460,23 +475,33 @@ def maybe_open_trades(symbol: str, rsi_value: float, price: float):
             continue
 
         if long_sig and signal_allowed(symbol, mode, "long"):
-            open_position(symbol, mode, "long", lot_usd, price)
+            open_position(symbol, mode, "long", lot_usd, price, rsi_value)
             mark_signal(symbol, mode, "long")
 
         elif short_sig and signal_allowed(symbol, mode, "short"):
-            open_position(symbol, mode, "short", lot_usd, price)
+            open_position(symbol, mode, "short", lot_usd, price, rsi_value)
             mark_signal(symbol, mode, "short")
 
 def heartbeat_summary():
-    global last_summary_ts
+    global last_summary_ts, hourly_stats, current_capital
     now_ts = time.time()
     if now_ts - last_summary_ts >= 3600:
-        notifier.send_totals(**pnl_counters)
+        notifier.send_hourly_summary(
+            total_capital=current_capital,
+            trades=hourly_stats["trades"],
+            wins=hourly_stats["wins"],
+            losses=hourly_stats["losses"],
+            hourly_pnl=hourly_stats["pnl"]
+        )
+        hourly_stats = {
+            "start_time": now_ts,
+            "trades": 0,
+            "wins": 0,
+            "losses": 0,
+            "pnl": 0.0
+        }
         last_summary_ts = now_ts
 
-# ---------------------------
-# Señales y arranque
-# ---------------------------
 _running = True
 def handle_sigterm(signum, frame):
     global _running
@@ -490,12 +515,11 @@ def boot_banner():
     caps = f"A {CAP_A}/x{LOTS_A} · M {CAP_M}/x{LOTS_M} · C {CAP_C}/x{LOTS_C}"
     mode_txt = "LIVE" if LIVE == 1 else "PAPER 🧪"
     txt = (
-        f"🚀 BOT ZAFFEX - RÉPLICA EXACTA\n"
+        f"🚀 BOT ZAFFEX - CON RESUMEN HORARIO\n"
         f"🧩 Exchange: {EXCHANGE_ID} | Modo: {mode_txt}\n"
-        f"⏰ Timeframe: {TIMEFRAME}\n"
+        f"💰 Capital inicial: ${INITIAL_CAPITAL:,.2f}\n"
         f"📊 RSI({RSI_PERIOD}) — Buy < {RSI_BUY_THRESHOLD} / Sell > {RSI_SELL_THRESHOLD}\n"
         f"🎯 TP/SL: {TAKE_PROFIT_PCT:.1f}% / {STOP_LOSS_PCT:.1f}%\n"
-        f"💰 Caps: {caps}\n"
         f"📈 Símbolos: {', '.join(SYMBOLS)}\n"
     )
     notifier.broadcast(txt)
