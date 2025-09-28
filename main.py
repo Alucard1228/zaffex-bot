@@ -400,7 +400,7 @@ def open_position(symbol: str, mode: str, side: str, lot_usd: float, price: floa
         timeframe=TIMEFRAME,
         size_usd=lot_usd,
         qty=qty,
-        rsi_value=rsi_value
+        rsi_value=rsi_value,
         take_profit_pct=TAKE_PROFIT_PCT,
         stop_loss_pct=STOP_LOSS_PCT
     )
@@ -551,4 +551,5 @@ def main():
 
 if __name__ == "__main__":
     main()
+
 
