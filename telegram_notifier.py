@@ -40,7 +40,6 @@ class TelegramNotifier:
                     self.allowed.append(int(str(cid).strip()))
                 except Exception:
                     pass
-        # 🔧 CORREGIDO: URL sin espacios
         self.api = f"https://api.telegram.org/bot{self.token}" if self.token else ""
         self.session = requests.Session() if self.token else None
 
@@ -65,17 +64,19 @@ class TelegramNotifier:
     def broadcast(self, text: str):
         self._post(text)
 
-    def send_open(self, symbol, mode, side, lots, entry, sl, tp, timeframe, size_usd, qty):
+    def send_open(self, symbol, mode, side, lots, entry, sl, tp, timeframe, size_usd, qty, rsi_value=None):
+        rr = TPtoSL(entry, tp, sl)
+        rsi_txt = f"{rsi_value:.1f}" if rsi_value is not None else "n/a"
         text = (
-            f"🔥 <b>{side.upper()} ABIERTO</b>\n\n"
-            f"🪙 <b>Símbolo:</b> {symbol}\n"
-            f"🎯 <b>Modo:</b> {mode} — Lotes: {lots}\n"
-            f"💰 <b>Entrada:</b> ${entry:,.2f}\n"
-            f"🛑 <b>Stop Loss:</b> ${sl:,.2f}\n"
-            f"✅ <b>Take Profit:</b> ${tp:,.2f}\n"
-            f"⚖️ <b>Risk/Reward:</b> 1:{TPtoSL(entry, tp, sl):.1f}\n"
-            f"⏰ <b>Timeframe:</b> {timeframe}\n"
-            f"💼 <b>Tamaño:</b> ${size_usd:,.2f} ({qty} base)\n"
+            f"⚡ <b>NUEVA POSICIÓN</b>\n"
+            f"{'🟢' if side == 'LONG' else '🔴'} <b>{side}</b> | {symbol}\n\n"
+            f"📊 <b>Modo:</b> {mode} ({lots} lotes)\n"
+            f"💰 <b>Capital:</b> ${size_usd:,.2f}\n"
+            f"📈 <b>Entrada:</b> ${entry:,.4f}\n"
+            f"✅ <b>TP:</b> ${tp:,.4f} ({TAKE_PROFIT_PCT:.1f}%)\n"
+            f"🛑 <b>SL:</b> ${sl:,.4f} ({STOP_LOSS_PCT:.1f}%)\n"
+            f"⚖️ <b>R:R</b> = 1:{rr:.1f}\n"
+            f"🕒 <b>TF:</b> {timeframe} | RSI: {rsi_txt}\n"
         )
         self._post(text)
 
@@ -83,31 +84,40 @@ class TelegramNotifier:
         text = (
             f"🟢 <b>TP Parcial</b>\n\n"
             f"🪙 <b>Símbolo:</b> {symbol}\n"
-            f"🎯 <b>Modo:</b> {mode} · {side.upper()}\n"
-            f"🔹 <b>Ejecutado:</b> {partial_pct:.0f}% @ ${price:,.2f}\n"
+            f"🎯 <b>Modo:</b> {mode} · {side}\n"
+            f"🔹 <b>Ejecutado:</b> {partial_pct:.0f}% @ ${price:,.4f}\n"
         )
         self._post(text)
 
-    def send_close(self, symbol, mode, side, reason, gross, fees, pnl, duration_sec):
+    def send_close(self, symbol, mode, side, reason, gross, fees, pnl, duration_sec, entry, exit_price, current_capital):
         dur = format_duration(duration_sec)
         emoji = "✅" if pnl >= 0 else "❌"
+        change_pct = abs((exit_price - entry) / entry * 100)
         text = (
-            f"{emoji} <b>CIERRE {side.upper()} ({reason})</b>\n\n"
-            f"🪙 <b>Símbolo:</b> {symbol}\n"
-            f"🎯 <b>Modo:</b> {mode}\n\n"
-            f"💵 <b>Gross:</b> {_fmt_money(gross)}\n"
-            f"💸 <b>Fees:</b> {_fmt_money(fees)}\n"
-            f"📊 <b>PnL:</b> {_fmt_money(pnl)}\n"
-            f"⏱️ <b>Duración:</b> {dur}\n"
+            f"{emoji} <b>OPERACIÓN CERRADA</b>\n"
+            f"{'🟢' if side == 'LONG' else '🔴'} {symbol} | {mode}\n\n"
+            f"📍 <b>Entrada:</b> ${entry:,.4f} → <b>Salida:</b> ${exit_price:,.4f}\n"
+            f"📊 <b>PnL:</b> {_fmt_money(pnl)} ({change_pct:.2f}%)\n"
+            f"💰 <b>Capital actual:</b> ${current_capital:,.2f}\n"
+            f"⏱️ <b>Duración:</b> {dur} | <b>Razón:</b> {reason}\n"
         )
         self._post(text)
 
-    def send_totals(self, trades, wins, losses, pnl, fees, gross):
-        text = (
-            f"📊 <b>RESUMEN 1h</b>\n\n"
-            f"🧾 <b>Operaciones:</b> {trades}  (✅ {wins} · ❌ {losses})\n"
-            f"💵 <b>Gross:</b> {_fmt_money(gross)}\n"
-            f"💸 <b>Fees:</b> {_fmt_money(fees)}\n"
-            f"📈 <b>PnL neto:</b> {_fmt_money(pnl)}\n"
-        )
+    def send_hourly_summary(self, total_capital, trades, wins, losses, hourly_pnl):
+        if trades == 0:
+            text = (
+                f"📊 <b>RESUMEN HORARIO</b>\n\n"
+                f"🕒 <b>Última hora:</b> Sin operaciones\n"
+                f"💰 <b>Capital actual:</b> ${total_capital:,.2f}\n"
+            )
+        else:
+            win_rate = wins / trades * 100
+            emoji = "📈" if hourly_pnl >= 0 else "📉"
+            text = (
+                f"{emoji} <b>RESUMEN HORARIO</b>\n\n"
+                f"🧾 <b>Operaciones:</b> {trades} (✅ {wins} · ❌ {losses})\n"
+                f"🎯 <b>Win Rate:</b> {win_rate:.1f}%\n"
+                f"📊 <b>PnL esta hora:</b> {_fmt_money(hourly_pnl)}\n"
+                f"💰 <b>Capital actual:</b> ${total_capital:,.2f}\n"
+            )
         self._post(text)
