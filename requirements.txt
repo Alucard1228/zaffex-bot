@@ -1,8 +1,4 @@
-# Core exchange client
 ccxt>=4.3.80
-
-# HTTP para Telegram API
 requests>=2.31.0
-
-# Zona horaria en sistemas sin tzdata (Windows/containers slim)
 tzdata>=2024.1
+
