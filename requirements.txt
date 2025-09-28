@@ -1,6 +1,8 @@
-python-dotenv==1.0.1
-ta==0.11.0
-requests==2.31.0
-ccxt>=4.0.0,<5.0.0
+# Core exchange client
+ccxt>=4.3.80
 
+# HTTP para Telegram API
+requests>=2.31.0
 
+# Zona horaria en sistemas sin tzdata (Windows/containers slim)
+tzdata>=2024.1
