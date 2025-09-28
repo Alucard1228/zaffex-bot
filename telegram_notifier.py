@@ -32,17 +32,9 @@ def TPtoSL(entry: float, tp: float, sl: float) -> float:
 
 class TelegramNotifier:
     """
-    Clase compatible con:
-      TelegramNotifier(token=..., allowed_chat_ids=[...])
-    y también con llamada posicional:
-      TelegramNotifier("BOT_TOKEN", [12345])
+    Notificador para Telegram usando la API HTTP directamente.
     """
     def __init__(self, token: str = "", allowed_chat_ids=None, **kwargs):
-        # compat: permitir argumentos posicionales antiguos
-        if isinstance(token, (list, tuple)) and allowed_chat_ids is None:
-            # Caso viejo: TelegramNotifier([ids]) – no recomendado, pero evitamos crashear
-            allowed_chat_ids = token
-            token = ""
         self.token = token or ""
         self.allowed = []
         if allowed_chat_ids:
@@ -51,6 +43,7 @@ class TelegramNotifier:
                     self.allowed.append(int(str(cid).strip()))
                 except Exception:
                     pass
+        # 🔧 CORREGIDO: sin espacios después de 'bot'
         self.api = f"https://api.telegram.org/bot{self.token}" if self.token else ""
         self.session = requests.Session() if self.token else None
 
@@ -75,17 +68,15 @@ class TelegramNotifier:
     def broadcast(self, text: str):
         self._post(text)
 
-    # ----- Mensajes de negocio -----
-    def send_open(self, symbol, mode, side, lots, entry, sl, tp, rsi, timeframe, size_usd, qty):
+    def send_open(self, symbol, mode, side, lots, entry, sl, tp, timeframe, size_usd, qty):
         text = (
-            f"🔥 <b>{'LONG' if side=='LONG' else 'SHORT'} ABIERTO</b>\n\n"
+            f"🔥 <b>{side.upper()} ABIERTO</b>\n\n"
             f"🪙 <b>Símbolo:</b> {symbol}\n"
-            f"🎯 <b>Modo:</b> {mode} — Lado: <b>{side}</b>\n"
-            f"📊 <b>Lotes:</b> {lots}\n\n"
+            f"🎯 <b>Modo:</b> {mode} — Lotes: {lots}\n"
             f"💰 <b>Entrada:</b> ${entry:,.2f}\n"
             f"🛑 <b>Stop Loss:</b> ${sl:,.2f}\n"
             f"✅ <b>Take Profit:</b> ${tp:,.2f}\n"
-            f"⚖️ <b>Risk/Reward:</b> 1:{(TPtoSL(entry, tp, sl)):.1f}\n\n"
+            f"⚖️ <b>Risk/Reward:</b> 1:{TPtoSL(entry, tp, sl):.1f}\n"
             f"⏰ <b>Timeframe:</b> {timeframe}\n"
             f"💼 <b>Tamaño:</b> ${size_usd:,.2f} ({qty} base)\n"
         )
@@ -95,7 +86,7 @@ class TelegramNotifier:
         text = (
             f"🟢 <b>TP Parcial</b>\n\n"
             f"🪙 <b>Símbolo:</b> {symbol}\n"
-            f"🎯 <b>Modo:</b> {mode} · Lado: <b>{side}</b>\n"
+            f"🎯 <b>Modo:</b> {mode} · {side.upper()}\n"
             f"🔹 <b>Ejecutado:</b> {partial_pct:.0f}% @ ${price:,.2f}\n"
         )
         self._post(text)
@@ -104,12 +95,12 @@ class TelegramNotifier:
         dur = format_duration(duration_sec)
         emoji = "✅" if pnl >= 0 else "❌"
         text = (
-            f"{emoji} <b>CIERRE {side} ({reason})</b>\n\n"
+            f"{emoji} <b>CIERRE {side.upper()} ({reason})</b>\n\n"
             f"🪙 <b>Símbolo:</b> {symbol}\n"
             f"🎯 <b>Modo:</b> {mode}\n\n"
-            f"💵 <b>Gross:</b> {self._fmt_money(gross)}\n"
-            f"💸 <b>Fees:</b> {self._fmt_money(fees)}\n"
-            f"📊 <b>PnL:</b> {self._fmt_money(pnl)}\n"
+            f"💵 <b>Gross:</b> {_fmt_money(gross)}\n"
+            f"💸 <b>Fees:</b> {_fmt_money(fees)}\n"
+            f"📊 <b>PnL:</b> {_fmt_money(pnl)}\n"
             f"⏱️ <b>Duración:</b> {dur}\n"
         )
         self._post(text)
@@ -118,16 +109,8 @@ class TelegramNotifier:
         text = (
             f"📊 <b>RESUMEN 1h</b>\n\n"
             f"🧾 <b>Operaciones:</b> {trades}  (✅ {wins} · ❌ {losses})\n"
-            f"💵 <b>Gross:</b> {self._fmt_money(gross)}\n"
-            f"💸 <b>Fees:</b> {self._fmt_money(fees)}\n"
-            f"📈 <b>PnL neto:</b> {self._fmt_money(pnl)}\n"
+            f"💵 <b>Gross:</b> {_fmt_money(gross)}\n"
+            f"💸 <b>Fees:</b> {_fmt_money(fees)}\n"
+            f"📈 <b>PnL neto:</b> {_fmt_money(pnl)}\n"
         )
         self._post(text)
-
-    @staticmethod
-    def _fmt_money(x: float) -> str:
-        sign = "" if x >= 0 else "-"
-        v = abs(x)
-        if v >= 1000:
-            return f"{sign}${v:,.2f}"
-        return f"{sign}${v:.2f}"
