@@ -4,9 +4,9 @@ Bot Zaffex - Réplica exacta del comportamiento observado
 - Timeframe: 1m
 - RSI(14): compra < 30, venta > 70
 - TP = 1.5%, SL = 1.0%
-- Modos: Agresivo ($50), Moderado ($200), Conservador ($100,000)
+- Modos: Agresivo, Moderado, Conservador (cada uno con límite, pero comparten balance real en la práctica)
 - Soporta largo y corto (requiere futuros/swap)
-- Mejoras: TP parcial, Break-even, Trailing, Timeout, Cooldowns
+- Fees ajustados a CoinEx Futures: 0.05% por lado
 """
 
 import os
@@ -60,24 +60,22 @@ def now_tz():
     return datetime.now(tz)
 
 # ---------------------------
-# Configuración por entorno (ajustada a Zaffex)
+# Configuración por entorno
 # ---------------------------
 EXCHANGE_ID = getenv_str("EXCHANGE", "coinex").lower()
 LIVE = getenv_int("LIVE", 0)
 TIMEFRAME = getenv_str("TIMEFRAME", "1m")
 SYMBOLS = [s.strip() for s in getenv_str("SYMBOLS", "BTC/USDT:USDT,ETH/USDT:USDT").split(",") if s.strip()]
-FEE_RATE = getenv_float("FEE_RATE", 0.002)
+FEE_RATE = getenv_float("FEE_RATE", 0.0005)  # 0.05% por lado (futuros CoinEx)
 
 RSI_PERIOD = getenv_int("RSI_PERIOD", 14)
-RSI_BUY_THRESHOLD = getenv_float("RSI_BUY_THRESHOLD", 30.0)   # Compra si RSI < 30
-RSI_SELL_THRESHOLD = getenv_float("RSI_SELL_THRESHOLD", 70.0) # Venta si RSI > 70
+RSI_BUY_THRESHOLD = getenv_float("RSI_BUY_THRESHOLD", 30.0)
+RSI_SELL_THRESHOLD = getenv_float("RSI_SELL_THRESHOLD", 70.0)
 RSI_HYST = getenv_float("RSI_HYSTERESIS", 3.0)
 
-# TP/SL ajustados para rentabilidad
 TAKE_PROFIT_PCT = getenv_float("TAKE_PROFIT_PCT", 1.5)  # %
 STOP_LOSS_PCT = getenv_float("STOP_LOSS_PCT", 1.0)      # %
 
-# Mejoras
 TP_PARTIAL_PCT = getenv_float("TP_PARTIAL_PCT", 40.0)
 ENABLE_BE = getenv_int("ENABLE_BREAKEVEN", 1) == 1
 BE_TRIGGER_PCT = getenv_float("BE_TRIGGER_PCT", 0.60)
@@ -91,14 +89,14 @@ SIGNAL_COOLDOWN = getenv_int("SIGNAL_COOLDOWN", 300)
 TIMEOUT_MIN = getenv_int("TIMEOUT_MIN", 25)
 LOSS_COOLDOWN_SEC = getenv_int("LOSS_COOLDOWN_SEC", 900)
 
-# --- LÍMITES DE CAPITAL POR MODO (como en Zaffex) ---
-CAP_A = min(getenv_float("CAPITAL_AGRESIVO", 50.0), 1000.0)
+# --- LÍMITES POR MODO (como en Zaffex) ---
+CAP_A = min(getenv_float("CAPITAL_AGRESIVO", 20.0), 1000.0)
 LOTS_A = max(1, getenv_int("LOT_SIZE_AGRESIVO", 3))
 
-CAP_M = min(getenv_float("CAPITAL_MODERADO", 200.0), 10000.0)
+CAP_M = min(getenv_float("CAPITAL_MODERADO", 20.0), 1000.0)
 LOTS_M = max(1, getenv_int("LOT_SIZE_MODERADO", 4))
 
-CAP_C = min(getenv_float("CAPITAL_CONSERVADOR", 100000.0), 1000000.0)
+CAP_C = min(getenv_float("CAPITAL_CONSERVADOR", 20.0), 1000.0)
 LOTS_C = max(1, getenv_int("LOT_SIZE_CONSERVADOR", 5))
 
 # Telegram
@@ -197,7 +195,7 @@ def fetch_price_and_rsi(symbol: str):
             return None, None
 
 # ---------------------------
-# Clase Position y lógica principal
+# Clase Position
 # ---------------------------
 class Position:
     def __init__(self, symbol, mode, side, qty, entry, tp, sl, opened_ts, notional):
@@ -325,7 +323,7 @@ def close_order_live(symbol, side, qty):
         return None
 
 def fee_cost(notional: float) -> float:
-    return notional * (FEE_RATE * 2.0)
+    return notional * (FEE_RATE * 2.0)  # ida + vuelta
 
 def record_close(pos: Position, close_price: float, reason: str):
     pos.closed = True
